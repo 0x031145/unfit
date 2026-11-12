@@ -1,0 +1,29 @@
+[project]
+name = "unfit"
+version = "0.1.0"
+description = "Verify and unpack FitGirl repacks on Linux via Wine"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[dependency-groups]
+dev = ["pytest>=8", "mypy>=1.11"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "SIM", "UP"]
+ignore = ["BLE001"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["unfit.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
