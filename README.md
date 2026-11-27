@@ -68,6 +68,10 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
 - `innoextract`, only for packs whose install script rebuilds files with
   helpers it carries (see [Install-script commands](#install-script-commands)).
 
+Both are packaged: `sudo dnf install xdelta innoextract` on Fedora,
+`sudo apt install xdelta3 innoextract` on Debian/Ubuntu,
+`brew install xdelta innoextract` on macOS.
+
 unfit removes `NoDefaultCurrentDirectoryInExePath` from the environment it
 gives Wine. Some tools, such as AI coding agents, set it in the shells they
 start, and Wine passes it on: Windows programs then no longer find executables

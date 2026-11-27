@@ -50,24 +50,42 @@ EXTRACTOR_URL = (
 LOGGER = logging.getLogger("unfit")
 
 
+def user_dir(variable: str, linux_default: str, macos_default: str) -> Path:
+    """Return a per-user unfit folder: the variable if set, else the platform default.
+
+    Args:
+        variable: Environment variable that overrides the default.
+        linux_default: Default below the home folder elsewhere than macOS.
+        macos_default: Default below the home folder on macOS.
+
+    Returns:
+        The folder, with ``~`` expanded.
+    """
+    override = os.environ.get(variable)
+    if override:
+        return Path(override).expanduser()
+    default = macos_default if sys.platform == "darwin" else linux_default
+    return Path.home() / default
+
+
 def default_data_dir() -> Path:
-    """Return the default directory for cached tools and the Wine prefix."""
-    env = os.environ.get("UNFIT_DATA_DIR")
-    if env:
-        return Path(env).expanduser()
-    if sys.platform == "darwin":
-        return Path.home() / "Library/Application Support/unfit"
-    return Path.home() / ".local/share/unfit"
+    """Return the default folder for cached tools and the Wine prefix.
+
+    Returns:
+        ``$UNFIT_DATA_DIR``, or the platform default.
+    """
+    return user_dir(
+        "UNFIT_DATA_DIR", ".local/share/unfit", "Library/Application Support/unfit"
+    )
 
 
 def default_state_dir() -> Path:
-    """Return the default directory for extraction logs."""
-    env = os.environ.get("UNFIT_STATE_DIR")
-    if env:
-        return Path(env).expanduser()
-    if sys.platform == "darwin":
-        return Path.home() / "Library/Logs/unfit"
-    return Path.home() / ".local/state/unfit"
+    """Return the default folder for extraction logs.
+
+    Returns:
+        ``$UNFIT_STATE_DIR``, or the platform default.
+    """
+    return user_dir("UNFIT_STATE_DIR", ".local/state/unfit", "Library/Logs/unfit")
 
 
 DATA_DIR = default_data_dir()
@@ -601,7 +619,14 @@ def proton_candidates() -> list[Path]:
 
 
 def macos_wine_candidates() -> list[Path]:
-    """List common ``wine`` binary locations on macOS."""
+    """List common ``wine`` binary locations on macOS.
+
+    Heroic's builds come most recently installed first: its list mixes Wine
+    and CrossOver builds, whose version numbers do not compare.
+
+    Returns:
+        Homebrew, Heroic and ``Wine *.app`` paths, which may not exist.
+    """
     candidates = [
         Path("/opt/homebrew/bin/wine"),
         Path("/usr/local/bin/wine"),
@@ -812,7 +837,8 @@ def wine_environment() -> dict[str, str]:
     """Environment for the extractor: persistent prefix, quiet Wine.
 
     Wine passes Unix variables on to Windows programs, so
-    :data:`WINE_HOSTILE_VARIABLES` are removed.
+    :data:`WINE_HOSTILE_VARIABLES` are removed. On macOS, MoltenVK's logging
+    is turned off unless ``MVK_CONFIG_LOG_LEVEL`` is already set.
 
     Returns:
         A copy of the current environment with ``WINEPREFIX`` and ``WINEDEBUG``.
@@ -825,7 +851,7 @@ def wine_environment() -> dict[str, str]:
     if sys.platform == "darwin":
         # MoltenVK otherwise logs its full extension list once per Wine process,
         # drowning out the extractor's output and the run log.
-        environment["MVK_CONFIG_LOG_LEVEL"] = "0"
+        environment.setdefault("MVK_CONFIG_LOG_LEVEL", "0")
     return environment
 
 

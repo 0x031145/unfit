@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -313,11 +315,11 @@ def test_default_dirs_respect_platform_and_env(
     monkeypatch.delenv("UNFIT_DATA_DIR", raising=False)
     monkeypatch.delenv("UNFIT_STATE_DIR", raising=False)
 
-    monkeypatch.setattr(unfit.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
     assert unfit.default_data_dir() == (tmp_path / "Library/Application Support/unfit")
     assert unfit.default_state_dir() == tmp_path / "Library/Logs/unfit"
 
-    monkeypatch.setattr(unfit.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert unfit.default_data_dir() == tmp_path / ".local/share/unfit"
     assert unfit.default_state_dir() == tmp_path / ".local/state/unfit"
 
@@ -353,9 +355,9 @@ def test_detect_wine_uses_macos_candidates_on_darwin(
 ) -> None:
     fake_wine = make_file(tmp_path / "wine", b"#!/bin/sh\necho wine-11.0\n")
     fake_wine.chmod(0o755)
-    monkeypatch.setattr(unfit.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.delenv("UNFIT_WINE", raising=False)
-    monkeypatch.setattr(unfit.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
     monkeypatch.setattr(unfit, "macos_wine_candidates", lambda: [fake_wine])
 
     assert unfit.detect_wine(None) == fake_wine
@@ -365,11 +367,20 @@ def test_wine_environment_silences_moltenvk_on_darwin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MVK_CONFIG_LOG_LEVEL", raising=False)
-    monkeypatch.setattr(unfit.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
     environment = unfit.wine_environment()
     assert environment["WINEPREFIX"] == str(unfit.PREFIX_DIR)
     assert environment["WINEDEBUG"] == "-all"
     assert environment["MVK_CONFIG_LOG_LEVEL"] == "0"
 
-    monkeypatch.setattr(unfit.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert "MVK_CONFIG_LOG_LEVEL" not in unfit.wine_environment()
+
+
+def test_wine_environment_keeps_a_chosen_moltenvk_log_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MVK_CONFIG_LOG_LEVEL", "2")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert unfit.wine_environment()["MVK_CONFIG_LOG_LEVEL"] == "2"
