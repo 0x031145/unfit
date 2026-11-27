@@ -88,8 +88,10 @@ extraction failure, `2` environment or usage error, `130` interrupted.
    destination, then checks free space.
 4. Unpacks with `--skip-bin-check --skip-verify`, streaming and logging the
    extractor output to `~/.local/state/unfit/logs/` (one log per run).
-5. Repairs the layout, replays post-install scripts (both below).
-6. Verifies the result against `_Redist/fitgirl.md5`.
+5. Retries volumes that failed because they need a tool from another volume
+   (below).
+6. Repairs the layout, replays post-install scripts (both below).
+7. Verifies the result against `_Redist/fitgirl.md5`.
 
 ### Layout repair
 
@@ -99,6 +101,33 @@ in the destination root, so a naive check reports
 `40 ok, 0 bad, 1 missing`. `unfit` detects that case, confirms the file's MD5
 matches the manifest entry, moves it to the recorded path, and re-verifies — so
 that repack ends with `41 ok, 0 bad, 0 missing` and exit `0`.
+
+### Installer tools in a volume
+
+Some packs ship an external decompressor in a volume of its own and run it by
+a relative path from `arc.ini`, for example a small volume holding
+`tools\xtool.exe` while the main volume is unpacked with:
+
+```ini
+[External compressor:example]
+unpackcmd = tools\xtool.exe decode -t100p - - <stdin> <stdout>
+```
+
+The installer unpacks that volume into its temp folder first. The extractor
+unpacks every volume into the game folder and runs `unarc.dll` from a temp
+folder it recreates on every run, so the main volume fails right away with
+`archive data corrupted (decompression fails)`.
+
+`unfit` copies `arc.ini` out of the extractor's work folder while the
+extractor runs. If a volume fails and a folder that `arc.ini` runs tools from
+(and that `_Redist/fitgirl.md5` does not list as game files) was unpacked, it:
+
+1. puts a copy of `fitgirl-extractor.exe` and those folders into
+   `DEST/.unfit-tools/` (Wine looks for a relative program name like
+   `tools\xtool.exe` in the running exe's folder first),
+2. unpacks each failed volume again with that copy (`--only`),
+3. removes `.unfit-tools/` and, once everything unpacked, the tool folders
+   from the game folder, where the installer never puts them.
 
 ### Post-install scripts
 

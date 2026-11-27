@@ -15,6 +15,7 @@ import argparse
 import concurrent.futures as cf
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import logging
 import os
@@ -490,6 +491,7 @@ def build_extract_command(
     skip_bin_check: bool = False,
     skip_verify: bool = False,
     verbose: bool = False,
+    only: Sequence[str] = (),
 ) -> list[str]:
     """Assemble the extractor command line for Wine."""
     command = [str(wine), str(extractor), str(pack_dir)]
@@ -497,6 +499,8 @@ def build_extract_command(
         command.extend(["-d", str(dest)])
     if list_only:
         command.append("--list")
+    for volume in only:
+        command.extend(["--only", volume])
     if skip_bin_check:
         command.append("--skip-bin-check")
     if skip_verify:
@@ -1392,6 +1396,180 @@ def run_list(
     return run_streaming(command, log_path=log_path, echo=echo)
 
 
+# --- installer tools shipped in a volume --------------------------------------
+#
+# Some packs ship an external decompressor in a volume of its own, e.g. a
+# small volume with tools\xtool.exe, and arc.ini runs it by that relative
+# path. The real installer unpacks that volume into its temp folder first.
+# fitgirl-extractor unpacks every volume into the game folder instead and runs
+# unarc.dll from a temp folder it recreates per run, so the volume that needs
+# the tool fails with "archive data corrupted (decompression fails)". Wine
+# looks up relative program names in the folder of the running .exe first, so
+# a copy of the extractor next to the tool folders can find them.
+
+EXTRACTOR_ARC_INI = PurePosixPath(".fgtmp/setup/tmp/arc.ini")
+TOOL_STAGING_DIR = ".unfit-tools"
+ARC_POLL_INTERVAL = 0.2
+FAILED_VOLUME = re.compile(r"^WARNING: (\S.*?\.bin) failed\b", re.IGNORECASE)
+UNPACK_COMMAND = re.compile(
+    r'^\s*unpackcmd\s*=\s*("[^"]+"|\S+)', re.IGNORECASE | re.MULTILINE
+)
+
+
+class ArcIniCatcher:
+    """Copy arc.ini out of the extractor's work folder while it exists.
+
+    fitgirl-extractor deletes its work folder when it exits, and arc.ini is
+    the only place that says which external tools the archives need.
+    """
+
+    def __init__(self, dest: Path) -> None:
+        """Watch ``dest`` for the extractor's arc.ini."""
+        self._path = dest / EXTRACTOR_ARC_INI
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._previous: str | None = None
+        self.text: str | None = None
+
+    def __enter__(self) -> ArcIniCatcher:
+        """Start watching."""
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        """Stop watching."""
+        self._stop.set()
+        self._thread.join(timeout=ARC_POLL_INTERVAL * 5)
+
+    def _poll(self) -> None:
+        while not self._stop.wait(ARC_POLL_INTERVAL):
+            if self._grab():
+                return
+
+    def _grab(self) -> bool:
+        """Keep the file once two reads in a row agree (it is fully written)."""
+        try:
+            text = self._path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            self._previous = None
+            return False
+        if text and text == self._previous:
+            self.text = text
+            return True
+        self._previous = text
+        return False
+
+
+def collect_failed_volume(line: str, failed: list[str]) -> None:
+    """Record volumes the extractor reports as failed."""
+    match = FAILED_VOLUME.match(line.strip())
+    if match and match.group(1) not in failed:
+        failed.append(match.group(1))
+
+
+def parse_arc_tool_dirs(text: str) -> set[str]:
+    """Folders that arc.ini runs external tools from (``tools\\xtool.exe``)."""
+    folders: set[str] = set()
+    for match in UNPACK_COMMAND.finditer(text):
+        program = PureWindowsPath(match.group(1).strip('"'))
+        parts = program.parts
+        if program.drive or program.root or len(parts) < 2 or ".." in parts:
+            continue
+        folders.add(parts[0])
+    return folders
+
+
+def find_tool_dirs(dest: Path, names: set[str]) -> list[Path]:
+    """Unpacked top-level folders that arc.ini uses as tool folders.
+
+    A folder that ``_Redist/fitgirl.md5`` lists files in belongs to the game
+    and is never treated as a tool folder.
+    """
+    wanted = {name.lower() for name in names}
+    if not wanted or not dest.is_dir():
+        return []
+    manifest = destination_manifest(dest) or {}
+    owned = {PurePosixPath(path).parts[0].lower() for path in manifest}
+    return sorted(
+        entry
+        for entry in dest.iterdir()
+        if entry.is_dir()
+        and entry.name.lower() in wanted
+        and entry.name.lower() not in owned
+    )
+
+
+def remove_tool_dirs(dest: Path, tool_dirs: Sequence[Path]) -> None:
+    """Delete installer tool folders from the game folder.
+
+    Only done when ``_Redist/fitgirl.md5`` exists, since that is what shows
+    the folders are not part of the game.
+    """
+    if not tool_dirs or destination_manifest(dest) is None:
+        return
+    for folder in tool_dirs:
+        shutil.rmtree(folder, ignore_errors=True)
+    names = ", ".join(f"{folder.name}\\" for folder in tool_dirs)
+    print(f"removed installer tools {names} from the game folder")
+
+
+def retry_with_tools(
+    pack: PackFiles,
+    tools: Toolchain,
+    options: RunOptions,
+    bar: ProgressBar,
+    total: int,
+    *,
+    failed: Sequence[str],
+    tool_dirs: Sequence[Path],
+) -> int:
+    """Unpack failed volumes again, with the tool folders next to the extractor.
+
+    Returns:
+        0 when every retried volume unpacked, 1 otherwise.
+    """
+    staging = options.dest / TOOL_STAGING_DIR
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir()
+    names = ", ".join(f"{folder.name}\\" for folder in tool_dirs)
+    still_failed: list[str] = []
+    try:
+        extractor = staging / tools.extractor.name
+        shutil.copy2(tools.extractor, extractor)
+        for folder in tool_dirs:
+            shutil.copytree(folder, staging / folder.name)
+        for volume in failed:
+            print(f"retrying {volume} with the installer tools {names}")
+            again: list[str] = []
+            command = build_extract_command(
+                tools.wine,
+                extractor,
+                pack.pack_dir,
+                options.dest,
+                skip_bin_check=True,
+                skip_verify=True,
+                verbose=options.verbose,
+                only=[volume],
+            )
+            code = run_streaming(
+                command,
+                log_path=options.log_path,
+                dest=options.dest,
+                total=total,
+                bar=bar,
+                echo=options.echo,
+                on_line=functools.partial(collect_failed_volume, failed=again),
+            )
+            if code != 0 or again:
+                still_failed.append(volume)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    if still_failed:
+        print(f"still failing with the installer tools: {', '.join(still_failed)}")
+        return 1
+    return 0
+
+
 def run_extract(
     pack: PackFiles,
     tools: Toolchain,
@@ -1448,14 +1626,33 @@ def run_extract(
         f"unpacking {len(pack.bins)} volume(s), {total / 1024**3:.2f} GiB "
         f"into {options.dest}"
     )
-    code = run_streaming(
-        command,
-        log_path=options.log_path,
-        dest=options.dest,
-        total=total,
-        bar=bar,
-        echo=options.echo,
+    failed: list[str] = []
+    with ArcIniCatcher(options.dest) as catcher:
+        code = run_streaming(
+            command,
+            log_path=options.log_path,
+            dest=options.dest,
+            total=total,
+            bar=bar,
+            echo=options.echo,
+            on_line=functools.partial(collect_failed_volume, failed=failed),
+        )
+    tool_dirs = (
+        find_tool_dirs(options.dest, parse_arc_tool_dirs(catcher.text))
+        if catcher.text
+        else []
     )
+    if failed and tool_dirs:
+        code = retry_with_tools(
+            pack, tools, options, bar, total, failed=failed, tool_dirs=tool_dirs
+        )
+    elif failed:
+        print(
+            "note: no installer tool folders from arc.ini were unpacked, "
+            "so the failed volume(s) were not retried"
+        )
+    if code == 0:
+        remove_tool_dirs(options.dest, tool_dirs)
     if code != 0:
         print(f"extractor exited with code {code}", file=sys.stderr)
 
