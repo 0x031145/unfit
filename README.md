@@ -3,6 +3,22 @@
 Verify and unpack FitGirl repacks on Linux, without remembering the Wine
 incantation.
 
+> [!CAUTION]
+> unfit does not work with every repack. It has been tested on a handful of
+> packs only, and is unofficial: not affiliated with FitGirl or with
+> fitgirl-extractor.
+>
+> - Only packs whose `setup.exe` is Inno Setup and ships `unarc.dll` (FreeArc)
+>   can be unpacked. Each compression method also needs a 64-bit helper that
+>   works under Wine; methods the tested packs did not use may fail.
+> - Post-install scripts are replayed only when they use the commands listed
+>   under [Post-install scripts](#post-install-scripts); anything else is
+>   reported and skipped, and the affected files will fail verification.
+> - It is not an installer: redistributables, registry entries and shortcuts
+>   are not applied.
+>
+> Keep the `.bin` files until the final check reports `0 bad, 0 missing`.
+
 ```sh
 unfit /path/to/repack/
 ```
