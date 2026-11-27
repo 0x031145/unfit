@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""unfit - verify and unpack FitGirl repacks on Linux.
+"""unfit - verify and unpack FitGirl repacks on Linux and macOS.
 
 FitGirl ``.bin`` volumes are produced by FitGirl's own modified FreeArc
 (``unarc.dll`` shipped inside ``setup.exe``), so stock ``unarc`` cannot read
 them.  This script drives ``fitgirl-extractor.exe`` (which calls that DLL under
-Wine), and adds the checks that matter on Linux: hash verification of the
-``.bin`` volumes, path and disk-space validation, a persistent Wine prefix, and
-a post-extraction pass that repairs files the installer would have moved.
+Wine), and adds the checks that matter on POSIX systems: hash verification of
+the ``.bin`` volumes, path and disk-space validation, a persistent Wine
+prefix, and a post-extraction pass that repairs files the installer would have
+moved.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import hashlib
 import logging
 import lzma
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -47,8 +49,29 @@ EXTRACTOR_URL = (
 
 LOGGER = logging.getLogger("unfit")
 
-DATA_DIR = Path(os.environ.get("UNFIT_DATA_DIR", "~/.local/share/unfit")).expanduser()
-STATE_DIR = Path(os.environ.get("UNFIT_STATE_DIR", "~/.local/state/unfit")).expanduser()
+
+def default_data_dir() -> Path:
+    """Return the default directory for cached tools and the Wine prefix."""
+    env = os.environ.get("UNFIT_DATA_DIR")
+    if env:
+        return Path(env).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/unfit"
+    return Path.home() / ".local/share/unfit"
+
+
+def default_state_dir() -> Path:
+    """Return the default directory for extraction logs."""
+    env = os.environ.get("UNFIT_STATE_DIR")
+    if env:
+        return Path(env).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Logs/unfit"
+    return Path.home() / ".local/state/unfit"
+
+
+DATA_DIR = default_data_dir()
+STATE_DIR = default_state_dir()
 PREFIX_DIR = DATA_DIR / "wineprefix"
 EXTRACTOR_PATH = DATA_DIR / "fitgirl-extractor.exe"
 
@@ -577,10 +600,32 @@ def proton_candidates() -> list[Path]:
     return [wine for _, _, wine in found]
 
 
+def macos_wine_candidates() -> list[Path]:
+    """List common ``wine`` binary locations on macOS."""
+    candidates = [
+        Path("/opt/homebrew/bin/wine"),
+        Path("/usr/local/bin/wine"),
+    ]
+    heroic_root = Path.home() / "Library/Application Support/heroic/tools/wine"
+    if heroic_root.is_dir():
+        heroic_bins: list[tuple[float, Path]] = []
+        for runtime in heroic_root.iterdir():
+            wine = runtime / "Contents/Resources/wine/bin/wine"
+            if wine.is_file():
+                heroic_bins.append((runtime.stat().st_mtime, wine))
+        heroic_bins.sort(key=lambda item: item[0], reverse=True)
+        candidates.extend(wine for _, wine in heroic_bins)
+    for app_dir in (Path("/Applications"), Path.home() / "Applications"):
+        for name in ("Wine Stable.app", "Wine Staging.app", "Wine Devel.app"):
+            candidates.append(app_dir / name / "Contents/Resources/wine/bin/wine")
+    return candidates
+
+
 def detect_wine(explicit: Path | None) -> Path:
     """Locate a Wine binary and confirm it runs.
 
-    Order: ``--wine``, ``$UNFIT_WINE``, ``wine`` on PATH, then Proton runtimes.
+    Order: ``--wine``, ``$UNFIT_WINE``, ``wine`` on PATH, then platform
+    locations (macOS Wine/Heroic bundles or Linux Proton runtimes).
 
     Args:
         explicit: The ``--wine`` argument, if given.
@@ -601,8 +646,17 @@ def detect_wine(explicit: Path | None) -> Path:
     if on_path:
         candidates.append(Path(on_path))
 
-    wine = pick_wine(candidates) or pick_wine(proton_candidates())
+    platform_candidates = (
+        macos_wine_candidates() if sys.platform == "darwin" else proton_candidates()
+    )
+    wine = pick_wine(candidates) or pick_wine(platform_candidates)
     if wine is None:
+        if sys.platform == "darwin":
+            raise UnfitError(
+                "no wine found. Install Wine with WoW64 support (e.g. "
+                "wine-stable via Homebrew or Heroic's Wine-11.18), or point "
+                "unfit at one with --wine / $UNFIT_WINE."
+            )
         raise UnfitError(
             "no wine found. Install Wine with WoW64 support, or point unfit at one "
             "with --wine / $UNFIT_WINE (a Proton build works too)."
@@ -616,9 +670,17 @@ def detect_wine(explicit: Path | None) -> Path:
         check=False,
     )
     if result.returncode != 0:
-        raise UnfitError(
-            f"{wine} does not run: {result.stderr.strip() or result.stdout.strip()}"
-        )
+        detail = result.stderr.strip() or result.stdout.strip()
+        if (
+            sys.platform == "darwin"
+            and platform.machine() == "arm64"
+            and not Path("/Library/Apple/usr/share/rosetta/rosetta").exists()
+        ):
+            detail = (
+                f"{detail} (Rosetta 2 appears missing; run "
+                "`softwareupdate --install-rosetta`)"
+            )
+        raise UnfitError(f"{wine} does not run: {detail}")
     LOGGER.info("using %s (%s)", wine, result.stdout.strip())
     return wine
 
@@ -3156,7 +3218,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(
         prog="unfit",
-        description="Verify and unpack FitGirl repacks on Linux (via Wine).",
+        description="Verify and unpack FitGirl repacks on Linux and macOS (via Wine).",
     )
     parser.add_argument(
         "pack_dir",

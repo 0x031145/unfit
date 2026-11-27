@@ -304,3 +304,58 @@ def test_check_destination_rejects_the_pack_and_its_children(tmp_path: Path) -> 
     with pytest.raises(unfit.UnfitError):
         unfit.check_destination(pack, pack / "output", overwrite=True)
     unfit.check_destination(pack, tmp_path / "elsewhere", overwrite=False)
+
+
+def test_default_dirs_respect_platform_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("UNFIT_DATA_DIR", raising=False)
+    monkeypatch.delenv("UNFIT_STATE_DIR", raising=False)
+
+    monkeypatch.setattr(unfit.sys, "platform", "darwin")
+    assert unfit.default_data_dir() == (tmp_path / "Library/Application Support/unfit")
+    assert unfit.default_state_dir() == tmp_path / "Library/Logs/unfit"
+
+    monkeypatch.setattr(unfit.sys, "platform", "linux")
+    assert unfit.default_data_dir() == tmp_path / ".local/share/unfit"
+    assert unfit.default_state_dir() == tmp_path / ".local/state/unfit"
+
+    monkeypatch.setenv("UNFIT_DATA_DIR", str(tmp_path / "custom-data"))
+    monkeypatch.setenv("UNFIT_STATE_DIR", str(tmp_path / "custom-state"))
+    assert unfit.default_data_dir() == tmp_path / "custom-data"
+    assert unfit.default_state_dir() == tmp_path / "custom-state"
+
+
+def test_macos_wine_candidates_prefers_newest_heroic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    heroic_root = tmp_path / "Library/Application Support/heroic/tools/wine"
+    older = heroic_root / "Wine-10.0/Contents/Resources/wine/bin/wine"
+    newer = heroic_root / "Wine-11.18/Contents/Resources/wine/bin/wine"
+    make_file(older, b"#")
+    make_file(newer, b"#")
+    os.utime(older.parents[3], (1, 1))
+    os.utime(newer.parents[3], (2, 2))
+
+    candidates = unfit.macos_wine_candidates()
+    assert Path("/opt/homebrew/bin/wine") in candidates
+    assert candidates.index(newer) < candidates.index(older)
+    assert (
+        tmp_path / "Applications/Wine Stable.app/Contents/Resources/wine/bin/wine"
+        in candidates
+    )
+
+
+def test_detect_wine_uses_macos_candidates_on_darwin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_wine = make_file(tmp_path / "wine", b"#!/bin/sh\necho wine-11.0\n")
+    fake_wine.chmod(0o755)
+    monkeypatch.setattr(unfit.sys, "platform", "darwin")
+    monkeypatch.delenv("UNFIT_WINE", raising=False)
+    monkeypatch.setattr(unfit.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(unfit, "macos_wine_candidates", lambda: [fake_wine])
+
+    assert unfit.detect_wine(None) == fake_wine

@@ -1,7 +1,7 @@
 # unfit
 
-Verify and unpack FitGirl repacks on Linux, without remembering the Wine
-incantation.
+Verify and unpack FitGirl repacks on Linux and macOS, without remembering the
+Wine incantation.
 
 > [!CAUTION]
 > unfit does not work with every repack. It has been tested on a handful of
@@ -52,12 +52,18 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
 
 ## Requirements
 
-- Linux, Python 3.10+
-- Wine with WoW64 support. Any prefix works; a Proton build is detected
-  automatically (`~/.steam/steam/steamapps/common/Proton*`). On Fedora,
-  Proton Experimental from Steam is enough — no system Wine needed.
+- Linux or macOS, Python 3.10+
+- Wine with WoW64 support.
+  - **Linux**: Any prefix works; a Proton build is detected automatically
+    (`~/.steam/steam/steamapps/common/Proton*`). On Fedora, Proton Experimental
+    from Steam is enough — no system Wine needed.
+  - **macOS**: Homebrew `wine-stable` or Heroic's `Wine-11.18`
+    (`~/Library/Application Support/heroic/tools/wine/...`) is detected
+    automatically. On Apple Silicon, Rosetta 2 is required as well.
 - `fitgirl-extractor.exe` v0.2.1 is downloaded on first use into
-  `~/.local/share/unfit/` and checked against a pinned SHA-256.
+  `~/.local/share/unfit/` on Linux or
+  `~/Library/Application Support/unfit/` on macOS, and checked against a
+  pinned SHA-256.
 - `xdelta3`, only for packs whose post-install scripts apply xdelta patches.
 - `innoextract`, only for packs whose install script rebuilds files with
   helpers it carries (see [Install-script commands](#install-script-commands)).
@@ -122,7 +128,8 @@ extraction failure, `2` environment or usage error, `130` interrupted.
 3. Runs `fitgirl-extractor --list` to learn the exact unpacked size, creates the
    destination, then checks free space.
 4. Unpacks with `--skip-bin-check --skip-verify`, streaming and logging the
-   extractor output to `~/.local/state/unfit/logs/` (one log per run).
+   extractor output to `~/.local/state/unfit/logs/` on Linux or
+   `~/Library/Logs/unfit/logs/` on macOS (one log per run).
 5. Retries volumes that failed because they need a tool from another volume
    (below).
 6. Repairs the layout, replays post-install scripts and install-script
