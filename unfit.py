@@ -62,6 +62,11 @@ SELECTIVE_PREFIX = "fg-selective"
 MANIFEST_TAG = re.compile(r"\s*\[[^\]]*\]\s*$")
 LIST_TOTAL = re.compile(r"(\d+) files?, (\d+) MB unpacked", re.IGNORECASE)
 MANIFEST_DIGEST = re.compile(r"[0-9a-fA-F]{32}")
+# Set by some tools (e.g. AI coding agents) for the shells they start. It stops
+# Windows programs from finding executables in the current folder, and
+# unarc.dll starts its decompressors (cls-srep_x64.exe, ...) by bare name from
+# there; every compressed volume then fails with "archive data corrupted".
+WINE_HOSTILE_VARIABLES = ("NoDefaultCurrentDirectoryInExePath",)
 
 
 class UnfitError(Exception):
@@ -744,12 +749,17 @@ def build_extract_command(
 def wine_environment() -> dict[str, str]:
     """Environment for the extractor: persistent prefix, quiet Wine.
 
+    Wine passes Unix variables on to Windows programs, so
+    :data:`WINE_HOSTILE_VARIABLES` are removed.
+
     Returns:
         A copy of the current environment with ``WINEPREFIX`` and ``WINEDEBUG``.
     """
     environment = dict(os.environ)
     environment["WINEPREFIX"] = str(PREFIX_DIR)
     environment["WINEDEBUG"] = "-all"
+    for name in WINE_HOSTILE_VARIABLES:
+        environment.pop(name, None)
     return environment
 
 

@@ -164,6 +164,19 @@ def test_build_extract_command_listing_has_no_dest() -> None:
     assert command == ["/wine", "/exe", "/pack", "--list"]
 
 
+def test_wine_environment_drops_the_no_current_directory_switch(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "1")
+    monkeypatch.setenv("UNFIT_KEEP_ME", "yes")
+
+    environment = unfit.wine_environment()
+
+    assert "NoDefaultCurrentDirectoryInExePath" not in environment
+    assert environment["UNFIT_KEEP_ME"] == "yes"
+    assert environment["WINEPREFIX"] == str(sandbox / "data/wineprefix")
+
+
 def test_pick_wine_skips_non_executable(tmp_path: Path) -> None:
     plain = make_file(tmp_path / "wine", b"#!/bin/sh\n")
     executable = make_file(tmp_path / "wine2", b"#!/bin/sh\n")

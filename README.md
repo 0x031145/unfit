@@ -62,6 +62,14 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
 - `innoextract`, only for packs whose install script rebuilds files with
   helpers it carries (see [Install-script commands](#install-script-commands)).
 
+unfit removes `NoDefaultCurrentDirectoryInExePath` from the environment it
+gives Wine. Some tools, such as AI coding agents, set it in the shells they
+start, and Wine passes it on: Windows programs then no longer find executables
+in the current folder. `unarc.dll` starts its decompressors
+(`cls-srep_x64.exe`, ...) that way, so with the variable set every compressed
+volume fails with `archive data corrupted (decompression fails)`. Unset it too
+when running `fitgirl-extractor.exe` or other FreeArc tools under Wine by hand.
+
 When a required tool is missing, unfit names it and exits (code 2). A
 missing `xdelta3` or `innoextract` is noticed after unpacking, when the
 post-install steps are read: install it, then run
