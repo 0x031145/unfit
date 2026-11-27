@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -34,7 +34,7 @@ if "--list" in args:
     print("    1 files, 1 MB unpacked, 1 MB packed")
     raise SystemExit(0)
 dest = Path(args[args.index("-d") + 1])
-only = [args[i + 1] for i, arg in enumerate(args) if arg == "--only"]
+only = [args[index + 1] for index, arg in enumerate(args) if arg == "--only"]
 volumes = only or ["fg-01.bin", "fg-02.bin"]
 
 work = dest / ".fgtmp/setup/tmp"
@@ -71,57 +71,41 @@ raise SystemExit(code)
 """
 
 
-def build_pack(root: Path) -> Path:
-    """Create a two-volume pack folder that ``find_pack_files`` accepts."""
-    pack = root / "Tool Game [FitGirl Repack]"
-    (pack / "MD5").mkdir(parents=True)
-    (pack / "setup.exe").write_bytes(b"stub")
-    lines = []
-    for name in ("fg-01.bin", "fg-02.bin"):
-        (pack / name).write_bytes(name.encode())
-        lines.append(f"{hashlib.md5(name.encode()).hexdigest()} *..\\{name}")
-    (pack / "MD5/fitgirl-bins.md5").write_text("\n".join(lines) + "\n")
-    return pack
-
-
 @pytest.fixture
-def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Send unfit's data, prefix and log directories into the test folder."""
-    monkeypatch.setattr(unfit, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(unfit, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(unfit, "PREFIX_DIR", tmp_path / "data/wineprefix")
-    return tmp_path
+def run_unfit(
+    make_pack: Callable[[str, Sequence[str]], Path],
+    make_wine: Callable[[str], Path],
+    extractor_stub: Path,
+) -> Callable[[Path], int]:
+    """Return a runner for unfit on a two-volume pack with the fakes."""
+    pack = make_pack("Tool Game [FitGirl Repack]", ["fg-01.bin", "fg-02.bin"])
+    wine = make_wine(FAKE_WINE)
 
+    def run(dest: Path) -> int:
+        return unfit.main(
+            [
+                str(pack),
+                "-d",
+                str(dest),
+                "--wine",
+                str(wine),
+                "--extractor",
+                str(extractor_stub),
+                "--no-progress",
+            ]
+        )
 
-def run_unfit(sandbox: Path, dest: Path) -> int:
-    """Run unfit on the fake pack with the fake wine and extractor."""
-    wine = sandbox / "fakewine"
-    wine.write_text(FAKE_WINE)
-    wine.chmod(0o755)
-    extractor = sandbox / "bin/fitgirl-extractor.exe"
-    extractor.parent.mkdir()
-    extractor.write_bytes(b"stub")
-    pack = build_pack(sandbox)
-    return unfit.main(
-        [
-            str(pack),
-            "-d",
-            str(dest),
-            "--wine",
-            str(wine),
-            "--extractor",
-            str(extractor),
-            "--no-progress",
-        ]
-    )
+    return run
 
 
 def test_failed_volume_is_retried_with_the_tools_next_to_the_extractor(
-    sandbox: Path, capsys: pytest.CaptureFixture[str]
+    sandbox: Path,
+    run_unfit: Callable[[Path], int],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     dest = sandbox / "game"
 
-    code = run_unfit(sandbox, dest)
+    code = run_unfit(dest)
     output = capsys.readouterr().out
 
     assert code == 0, output
@@ -175,10 +159,9 @@ def test_collect_failed_volume_reads_extractor_warnings() -> None:
 
 def test_build_extract_command_passes_only() -> None:
     command = unfit.build_extract_command(
-        Path("/usr/bin/wine"),
-        Path("/x/fitgirl-extractor.exe"),
+        unfit.Toolchain(Path("/wine"), Path("/exe")),
         Path("/pack"),
         Path("/dest"),
-        only=["fg-01.bin"],
+        unfit.ExtractFlags(only=("fg-01.bin",)),
     )
     assert command[-2:] == ["--only", "fg-01.bin"]

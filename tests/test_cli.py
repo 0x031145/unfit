@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -40,51 +40,27 @@ redist.mkdir(exist_ok=True)
 (redist / "fitgirl.md5").write_text(f"{digest} *..\\payload.bin\n")
 '''
 
-
-def build_pack(root: Path) -> Path:
-    """Create a minimal folder that ``find_pack_files`` accepts."""
-    pack = root / "Example Game [FitGirl Repack]"
-    (pack / "MD5").mkdir(parents=True)
-    (pack / "setup.exe").write_bytes(b"stub")
-    volume = pack / "fg-01.bin"
-    volume.write_bytes(b"volume")
-    digest = hashlib.md5(volume.read_bytes()).hexdigest()
-    (pack / "MD5/fitgirl-bins.md5").write_text(f"{digest} *..\\fg-01.bin\n")
-    return pack
-
-
-def build_tools(root: Path) -> tuple[Path, Path]:
-    """Create the fake wine binary and a stub extractor path."""
-    wine = root / "fakewine"
-    wine.write_text(FAKE_WINE)
-    wine.chmod(0o755)
-    extractor = root / "fitgirl-extractor.exe"
-    extractor.write_bytes(b"stub")
-    return wine, extractor
+PACK_NAME = "Example Game [FitGirl Repack]"
 
 
 @pytest.fixture
-def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Send unfit's data, prefix and log directories into the test folder."""
-    monkeypatch.setattr(unfit, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(unfit, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(unfit, "PREFIX_DIR", tmp_path / "data/wineprefix")
-    return tmp_path
+def pack(make_pack: Callable[[str, Sequence[str]], Path]) -> Path:
+    """A one-volume pack."""
+    return make_pack(PACK_NAME, ["fg-01.bin"])
 
 
-def tool_args(wine: Path, extractor: Path) -> list[str]:
-    """Return the CLI flags that point unfit at the fakes."""
-    return ["--wine", str(wine), "--extractor", str(extractor)]
+@pytest.fixture
+def tool_args(make_wine: Callable[[str], Path], extractor_stub: Path) -> list[str]:
+    """CLI flags that point unfit at the fake wine and extractor."""
+    return ["--wine", str(make_wine(FAKE_WINE)), "--extractor", str(extractor_stub)]
 
 
-def test_extracts_into_a_destination_that_does_not_exist(sandbox: Path) -> None:
-    pack = build_pack(sandbox)
-    wine, extractor = build_tools(sandbox)
+def test_extracts_into_a_destination_that_does_not_exist(
+    sandbox: Path, pack: Path, tool_args: list[str]
+) -> None:
     dest = sandbox / "fresh" / "Example Game"
 
-    code = unfit.main(
-        [str(pack), "-d", str(dest), *tool_args(wine, extractor), "--no-progress"]
-    )
+    code = unfit.main([str(pack), "-d", str(dest), *tool_args, "--no-progress"])
 
     assert code == 0
     assert (dest / "payload.bin").read_bytes() == b"game data"
@@ -92,21 +68,15 @@ def test_extracts_into_a_destination_that_does_not_exist(sandbox: Path) -> None:
 
 
 def test_quiet_hides_extractor_output(
-    sandbox: Path, capsys: pytest.CaptureFixture[str]
+    sandbox: Path,
+    pack: Path,
+    tool_args: list[str],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    pack = build_pack(sandbox)
-    wine, extractor = build_tools(sandbox)
     dest = sandbox / "fresh" / "Example Game"
 
     code = unfit.main(
-        [
-            str(pack),
-            "-d",
-            str(dest),
-            *tool_args(wine, extractor),
-            "--no-progress",
-            "--quiet",
-        ]
+        [str(pack), "-d", str(dest), *tool_args, "--no-progress", "--quiet"]
     )
     captured = capsys.readouterr()
 
@@ -116,17 +86,16 @@ def test_quiet_hides_extractor_output(
 
 
 def test_dry_run_allows_a_non_empty_destination(
-    sandbox: Path, capsys: pytest.CaptureFixture[str]
+    sandbox: Path,
+    pack: Path,
+    tool_args: list[str],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    pack = build_pack(sandbox)
-    wine, extractor = build_tools(sandbox)
     dest = sandbox / "occupied"
     dest.mkdir()
     (dest / "keep.txt").write_text("keep")
 
-    code = unfit.main(
-        [str(pack), "-d", str(dest), *tool_args(wine, extractor), "--dry-run"]
-    )
+    code = unfit.main([str(pack), "-d", str(dest), *tool_args, "--dry-run"])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -135,18 +104,11 @@ def test_dry_run_allows_a_non_empty_destination(
     assert (dest / "keep.txt").read_text() == "keep"
 
 
-def test_rejects_a_destination_inside_the_pack(sandbox: Path) -> None:
-    pack = build_pack(sandbox)
-    wine, extractor = build_tools(sandbox)
-
+def test_rejects_a_destination_inside_the_pack(
+    pack: Path, tool_args: list[str]
+) -> None:
     code = unfit.main(
-        [
-            str(pack),
-            "-d",
-            str(pack / "output"),
-            *tool_args(wine, extractor),
-            "--no-progress",
-        ]
+        [str(pack), "-d", str(pack / "output"), *tool_args, "--no-progress"]
     )
 
     assert code == 2

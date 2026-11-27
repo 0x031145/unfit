@@ -12,7 +12,6 @@ a post-extraction pass that repairs files the installer would have moved.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures as cf
 import contextlib
 import dataclasses
 import functools
@@ -29,7 +28,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple, TextIO
 
@@ -41,6 +41,8 @@ EXTRACTOR_URL = (
     f"v{EXTRACTOR_VERSION}/fitgirl-extractor.exe"
 )
 
+LOGGER = logging.getLogger("unfit")
+
 DATA_DIR = Path(os.environ.get("UNFIT_DATA_DIR", "~/.local/share/unfit")).expanduser()
 STATE_DIR = Path(os.environ.get("UNFIT_STATE_DIR", "~/.local/state/unfit")).expanduser()
 PREFIX_DIR = DATA_DIR / "wineprefix"
@@ -49,6 +51,8 @@ EXTRACTOR_PATH = DATA_DIR / "fitgirl-extractor.exe"
 CHUNK_SIZE = 8 << 20
 SPACE_MARGIN = 1 << 30
 PROGRESS_INTERVAL = 1.5
+REDRAW_INTERVAL = 0.2
+HASH_WORKERS = min(8, os.cpu_count() or 1)
 
 SELECTIVE_PREFIX = "fg-selective"
 MANIFEST_TAG = re.compile(r"\s*\[[^\]]*\]\s*$")
@@ -117,14 +121,18 @@ class VerifyReport:
 
     @property
     def clean(self) -> bool:
-        """Return True when every manifest entry matched."""
+        """Return True when every manifest entry matched.
+
+        Returns:
+            True when nothing is bad or missing.
+        """
         return not self.bad and not self.missing
 
 
 class ProgressBar:
     """Single-line progress renderer that can be cleared for log lines."""
 
-    def __init__(self, enabled: bool, stream: TextIO | None = None) -> None:
+    def __init__(self, *, enabled: bool, stream: TextIO | None = None) -> None:
         """Create a bar; ``enabled=False`` makes every call a no-op."""
         self._enabled = enabled
         self._stream = stream if stream is not None else sys.stderr
@@ -132,11 +140,22 @@ class ProgressBar:
 
     @property
     def enabled(self) -> bool:
-        """Return True when this bar renders anything."""
+        """Return True when this bar renders anything.
+
+        Returns:
+            The ``enabled`` flag given at construction.
+        """
         return self._enabled
 
     def render(self, done: int, total: int, label: str, start: float) -> None:
-        """Draw one progress line for a transfer in progress."""
+        """Draw one progress line for a transfer in progress.
+
+        Args:
+            done: Bytes processed so far.
+            total: Bytes expected in total.
+            label: Text in front of the numbers.
+            start: ``time.monotonic()`` when the transfer started.
+        """
         if not self._enabled:
             return
         percent = 100.0 if total <= 0 else min(100.0, done * 100.0 / total)
@@ -161,19 +180,26 @@ class ProgressBar:
 
 
 def is_safe_relative(relative_path: str) -> bool:
-    """Return True when a manifest path stays inside the extraction root."""
+    """Return True when a manifest path stays inside the extraction root.
+
+    Args:
+        relative_path: POSIX-style path from a manifest.
+
+    Returns:
+        False for absolute paths and paths with ``..``.
+    """
     path = PurePosixPath(relative_path)
     return not path.is_absolute() and not any(part == ".." for part in path.parts)
 
 
 def parse_md5_manifest(text: str) -> dict[str, str]:
-    """Parse a FitGirl ``*.md5`` manifest into ``relative path -> digest``.
+    r"""Parse a FitGirl ``*.md5`` manifest into ``relative path -> digest``.
 
     Entries that would escape the extraction root are dropped: the manifest
     comes from the downloaded pack and is not trusted with paths outside it.
 
     Args:
-        text: Manifest content, with lines like ``<md5> *..\\fg-01.bin``.
+        text: Manifest content, with lines like ``<md5> *..\fg-01.bin``.
 
     Returns:
         Mapping of POSIX-style relative paths to lowercase MD5 digests.
@@ -195,7 +221,14 @@ def parse_md5_manifest(text: str) -> dict[str, str]:
 
 
 def read_md5_manifest(path: Path) -> dict[str, str]:
-    """Read and parse a manifest file, tolerating non-UTF-8 bytes."""
+    """Read and parse a manifest file, tolerating non-UTF-8 bytes.
+
+    Args:
+        path: The ``*.md5`` file.
+
+    Returns:
+        Mapping of relative paths to MD5 digests, see :func:`parse_md5_manifest`.
+    """
     return parse_md5_manifest(path.read_text(encoding="utf-8", errors="replace"))
 
 
@@ -203,6 +236,12 @@ def derive_dest_name(pack_dir: Path) -> str:
     """Derive a destination folder name from the repack folder name.
 
     Trailing bracketed tags such as ``[FitGirl Repack]`` are dropped.
+
+    Args:
+        pack_dir: The repack folder.
+
+    Returns:
+        The folder name without its tag, or the plain name if nothing is left.
     """
     name = MANIFEST_TAG.sub("", pack_dir.name).strip(" -_")
     return name or pack_dir.name
@@ -213,6 +252,12 @@ def parse_unpacked_bytes(listing: str) -> int:
 
     The tool prints one ``N files, X MB unpacked, Y MB packed`` line per
     volume, and reports MiB under an ``MB`` label.
+
+    Args:
+        listing: The extractor's listing output.
+
+    Returns:
+        The unpacked size in bytes; 0 when no size line was found.
     """
     return sum(
         int(match.group(2)) * 1024 * 1024 for match in LIST_TOTAL.finditer(listing)
@@ -221,6 +266,12 @@ def parse_unpacked_bytes(listing: str) -> int:
 
 def find_pack_files(pack_dir: Path) -> PackFiles:
     """Locate ``setup.exe``, the ``fg-*.bin`` volumes and the MD5 manifest.
+
+    Args:
+        pack_dir: The repack folder.
+
+    Returns:
+        The files that make up the repack.
 
     Raises:
         UnfitError: If the folder is not a recognisable FitGirl repack.
@@ -243,25 +294,69 @@ def find_pack_files(pack_dir: Path) -> PackFiles:
 
 
 def is_selective(relative_path: str) -> bool:
-    """Return True for optional selective-download volumes."""
+    """Return True for optional selective-download volumes.
+
+    Args:
+        relative_path: Volume path from the bins manifest.
+
+    Returns:
+        True for ``fg-selective-*`` volumes.
+    """
     return PurePosixPath(relative_path).name.lower().startswith(SELECTIVE_PREFIX)
 
 
-def hash_file(path: Path, bar: ProgressBar | None = None) -> str:
-    """Return the MD5 hex digest of ``path``, optionally rendering progress."""
-    total = path.stat().st_size
-    digest = hashlib.md5()
-    done = 0
-    start = time.monotonic()
+def hash_file(path: Path, on_chunk: Callable[[int], None] | None = None) -> str:
+    """Return the MD5 hex digest of ``path``.
+
+    Args:
+        path: File to hash.
+        on_chunk: Called with the size of every chunk read, for progress.
+
+    Returns:
+        The lowercase hex digest.
+    """
+    digest = hashlib.md5(usedforsecurity=False)
     with path.open("rb") as handle:
         while chunk := handle.read(CHUNK_SIZE):
             digest.update(chunk)
-            done += len(chunk)
-            if bar is not None:
-                bar.render(done, total, path.name, start)
-    if bar is not None:
-        bar.clear()
+            if on_chunk is not None:
+                on_chunk(len(chunk))
     return digest.hexdigest()
+
+
+class ByteProgress:
+    """Thread-safe byte counter that redraws a progress line a few times a second."""
+
+    def __init__(self, bar: ProgressBar, total: int, label: str) -> None:
+        """Start counting towards ``total`` bytes.
+
+        Args:
+            bar: Progress renderer.
+            total: Bytes expected in total.
+            label: Text in front of the numbers.
+        """
+        self._bar = bar
+        self._total = total
+        self._label = label
+        self._done = 0
+        self._start = time.monotonic()
+        self._drawn = 0.0
+        self._lock = threading.Lock()
+
+    def add(self, count: int) -> None:
+        """Count processed bytes and redraw at most every ``REDRAW_INTERVAL``.
+
+        Args:
+            count: Bytes processed since the last call.
+        """
+        with self._lock:
+            self._done += count
+            now = time.monotonic()
+            if now - self._drawn < REDRAW_INTERVAL:
+                return
+            self._drawn = now
+            done = self._done
+        self._bar.render(done, self._total, self._label, self._start)
 
 
 def verify_against_manifest(
@@ -269,15 +364,49 @@ def verify_against_manifest(
     manifest: Mapping[str, str],
     bar: ProgressBar | None = None,
 ) -> VerifyReport:
-    """Hash every manifest entry under ``root`` and classify the results."""
+    """Hash every manifest entry under ``root`` and classify the results.
+
+    Files are hashed ``HASH_WORKERS`` at a time; MD5 releases the GIL, so
+    packs made of several large files verify several times faster.
+
+    Args:
+        root: Folder the manifest paths are relative to.
+        manifest: Mapping of relative paths to expected MD5 digests.
+        bar: Progress renderer, or None for no progress.
+
+    Returns:
+        Which entries matched, differed or were missing.
+    """
+    present = {
+        relative: root / relative
+        for relative in manifest
+        if (root / relative).is_file()
+    }
+    total = sum(path.stat().st_size for path in present.values())
+    progress = (
+        ByteProgress(bar, total, "verifying")
+        if bar is not None and bar.enabled
+        else None
+    )
+    on_chunk = progress.add if progress is not None else None
+    with ThreadPoolExecutor(max_workers=HASH_WORKERS) as pool:
+        digests = dict(
+            zip(
+                present,
+                pool.map(
+                    functools.partial(hash_file, on_chunk=on_chunk), present.values()
+                ),
+                strict=True,
+            )
+        )
+    if bar is not None:
+        bar.clear()
     report = VerifyReport(total=len(manifest))
     for relative, expected in sorted(manifest.items()):
-        candidate = root / relative
-        if not candidate.is_file():
+        actual = digests.get(relative)
+        if actual is None:
             report.missing.append(relative)
-            continue
-        actual = hash_file(candidate, bar)
-        if actual == expected:
+        elif actual == expected:
             report.ok.append(relative)
         else:
             report.bad.append(BadFile(relative, expected, actual))
@@ -285,7 +414,15 @@ def verify_against_manifest(
 
 
 def describe_report(report: VerifyReport, *, selective_missing: bool = False) -> str:
-    """Render a one-line verification summary."""
+    """Render a one-line verification summary.
+
+    Args:
+        report: Verification outcome.
+        selective_missing: Mention missing selective volumes as ignored.
+
+    Returns:
+        A summary such as ``3 ok, 0 bad, 1 missing``.
+    """
     summary = (
         f"{len(report.ok)} ok, {len(report.bad)} bad, {len(report.missing)} missing"
     )
@@ -323,14 +460,29 @@ def plan_root_fixups(root: Path, manifest: Mapping[str, str]) -> list[Move]:
 
 
 def apply_moves(moves: Sequence[Move]) -> None:
-    """Create parent folders and move each file into place."""
+    """Create parent folders and move each file into place.
+
+    Args:
+        moves: Files to move, see :func:`plan_root_fixups`.
+    """
     for move in moves:
         move.target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(move.source), str(move.target))
 
 
 def directory_size(root: Path, exclude: str = ".fgtmp") -> int:
-    """Total bytes of regular files under ``root``, skipping ``exclude``."""
+    """Total bytes of regular files under ``root``, skipping ``exclude``.
+
+    Files that disappear while the folder is walked (the extractor writes and
+    deletes temporary files) are not counted.
+
+    Args:
+        root: Folder to measure.
+        exclude: Folder name to skip at any depth.
+
+    Returns:
+        The size in bytes.
+    """
     total = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [name for name in dirnames if name != exclude]
@@ -341,7 +493,14 @@ def directory_size(root: Path, exclude: str = ".fgtmp") -> int:
 
 
 def check_windows_ansi(path: Path) -> None:
-    """Reject paths that ``unarc.dll`` cannot represent in the ANSI code page."""
+    """Reject paths that ``unarc.dll`` cannot represent in the ANSI code page.
+
+    Args:
+        path: Path that will be passed to the extractor.
+
+    Raises:
+        UnfitError: When the path is not representable in Windows-1252.
+    """
     try:
         str(path).encode("cp1252")
     except UnicodeEncodeError as error:
@@ -352,7 +511,14 @@ def check_windows_ansi(path: Path) -> None:
 
 
 def pick_wine(candidates: Sequence[Path]) -> Path | None:
-    """Return the first candidate that exists and is executable."""
+    """Return the first candidate that exists and is executable.
+
+    Args:
+        candidates: Wine binaries in order of preference.
+
+    Returns:
+        The first usable binary, or None.
+    """
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
@@ -360,7 +526,11 @@ def pick_wine(candidates: Sequence[Path]) -> Path | None:
 
 
 def proton_candidates() -> list[Path]:
-    """List ``wine`` binaries from installed Proton runtimes, newest first."""
+    """List ``wine`` binaries from installed Proton runtimes, newest first.
+
+    Returns:
+        Proton Experimental first, then other runtimes by modification time.
+    """
     roots = [
         Path.home() / ".steam/steam/steamapps/common",
         Path.home() / ".local/share/Steam/steamapps/common",
@@ -388,6 +558,12 @@ def detect_wine(explicit: Path | None) -> Path:
     """Locate a Wine binary and confirm it runs.
 
     Order: ``--wine``, ``$UNFIT_WINE``, ``wine`` on PATH, then Proton runtimes.
+
+    Args:
+        explicit: The ``--wine`` argument, if given.
+
+    Returns:
+        A Wine binary that answers ``--version``.
 
     Raises:
         UnfitError: If nothing usable is found, or Wine refuses to start.
@@ -420,12 +596,19 @@ def detect_wine(explicit: Path | None) -> Path:
         raise UnfitError(
             f"{wine} does not run: {result.stderr.strip() or result.stdout.strip()}"
         )
-    logging.getLogger("unfit").info("using %s (%s)", wine, result.stdout.strip())
+    LOGGER.info("using %s (%s)", wine, result.stdout.strip())
     return wine
 
 
 def sha256_file(path: Path) -> str:
-    """Return the SHA-256 hex digest of ``path``."""
+    """Return the SHA-256 hex digest of ``path``.
+
+    Args:
+        path: File to hash.
+
+    Returns:
+        The lowercase hex digest.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(CHUNK_SIZE):
@@ -434,7 +617,14 @@ def sha256_file(path: Path) -> str:
 
 
 def download_extractor(target: Path) -> None:
-    """Download the pinned extractor release and verify its digest."""
+    """Download the pinned extractor release and verify its digest.
+
+    Args:
+        target: Where to store the extractor.
+
+    Raises:
+        UnfitError: When the download fails or the digest does not match.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".part")
     print(f"downloading fitgirl-extractor {EXTRACTOR_VERSION}", flush=True)
@@ -456,7 +646,20 @@ def download_extractor(target: Path) -> None:
 
 
 def ensure_extractor(explicit: Path | None) -> Path:
-    """Return a usable extractor path, fetching the pinned build if needed."""
+    """Return a usable extractor path, fetching the pinned build if needed.
+
+    Order: ``--extractor``, ``$UNFIT_EXTRACTOR``, then the cached download, which
+    is fetched again when missing or when its checksum fails.
+
+    Args:
+        explicit: The ``--extractor`` argument, if given.
+
+    Returns:
+        Path to ``fitgirl-extractor.exe``.
+
+    Raises:
+        UnfitError: When an explicit path is missing or the download fails.
+    """
     env_path = os.environ.get("UNFIT_EXTRACTOR")
     if explicit is not None:
         candidate = explicit.expanduser()
@@ -470,9 +673,7 @@ def ensure_extractor(explicit: Path | None) -> Path:
             and not env_path
             and sha256_file(candidate) != EXTRACTOR_SHA256
         ):
-            logging.getLogger("unfit").warning(
-                "cached extractor failed its checksum, fetching it again"
-            )
+            LOGGER.warning("cached extractor failed its checksum, fetching it again")
             download_extractor(candidate)
         return candidate
     if explicit is not None or env_path:
@@ -481,50 +682,131 @@ def ensure_extractor(explicit: Path | None) -> Path:
     return candidate
 
 
+@dataclasses.dataclass(frozen=True)
+class ExtractFlags:
+    """Switches for one ``fitgirl-extractor`` run."""
+
+    list_only: bool = False
+    skip_bin_check: bool = False
+    skip_verify: bool = False
+    verbose: bool = False
+    only: tuple[str, ...] = ()
+
+
 def build_extract_command(
-    wine: Path,
-    extractor: Path,
-    pack_dir: Path,
-    dest: Path | None,
-    *,
-    list_only: bool = False,
-    skip_bin_check: bool = False,
-    skip_verify: bool = False,
-    verbose: bool = False,
-    only: Sequence[str] = (),
+    tools: Toolchain, pack_dir: Path, dest: Path | None, flags: ExtractFlags
 ) -> list[str]:
-    """Assemble the extractor command line for Wine."""
-    command = [str(wine), str(extractor), str(pack_dir)]
-    if dest is not None and not list_only:
+    """Assemble the extractor command line for Wine.
+
+    Args:
+        tools: Wine and the extractor to run.
+        pack_dir: Folder with ``setup.exe`` and the volumes.
+        dest: Destination; ignored for listings.
+        flags: Extractor switches.
+
+    Returns:
+        The command as a list of arguments.
+    """
+    command = [str(tools.wine), str(tools.extractor), str(pack_dir)]
+    if dest is not None and not flags.list_only:
         command.extend(["-d", str(dest)])
-    if list_only:
+    if flags.list_only:
         command.append("--list")
-    for volume in only:
+    for volume in flags.only:
         command.extend(["--only", volume])
-    if skip_bin_check:
+    if flags.skip_bin_check:
         command.append("--skip-bin-check")
-    if skip_verify:
+    if flags.skip_verify:
         command.append("--skip-verify")
-    if verbose:
+    if flags.verbose:
         command.append("--verbose")
     return command
 
 
 def wine_environment() -> dict[str, str]:
-    """Environment for the extractor: persistent prefix, quiet Wine."""
+    """Environment for the extractor: persistent prefix, quiet Wine.
+
+    Returns:
+        A copy of the current environment with ``WINEPREFIX`` and ``WINEDEBUG``.
+    """
     environment = dict(os.environ)
     environment["WINEPREFIX"] = str(PREFIX_DIR)
     environment["WINEDEBUG"] = "-all"
     return environment
 
 
+def stop_process_group(process: subprocess.Popen[str]) -> None:
+    """Stop a child started with ``start_new_session`` and everything it spawned.
+
+    Sends SIGTERM to the group, waits up to 30 seconds, then sends SIGKILL.
+    A group that already exited is not an error.
+
+    Args:
+        process: The child process.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired, ProcessLookupError):
+        process.wait(timeout=30)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProgressTarget:
+    """What to measure for the progress line: a folder growing towards a size."""
+
+    bar: ProgressBar
+    dest: Path
+    total: int
+
+
+def watch_progress(progress: ProgressTarget, stop: threading.Event) -> None:
+    """Redraw the progress line from the folder size until ``stop`` is set.
+
+    Args:
+        progress: Folder to measure and the size it grows towards.
+        stop: Set when the command has ended.
+    """
+    start = time.monotonic()
+    while not stop.wait(PROGRESS_INTERVAL):
+        size = directory_size(progress.dest)
+        progress.bar.render(size, progress.total, "unpacking", start)
+
+
+def relay_output(
+    lines: Iterable[str],
+    log: TextIO,
+    *,
+    bar: ProgressBar | None,
+    echo: bool,
+    on_line: Callable[[str], None] | None,
+) -> None:
+    """Copy command output to the log, the terminal and a callback.
+
+    Args:
+        lines: Output lines of the command.
+        log: Open run log.
+        bar: Progress line to clear before each echoed line, if any.
+        echo: Copy the output to stdout.
+        on_line: Called with every output line.
+    """
+    for line in lines:
+        if bar is not None:
+            bar.clear()
+        log.write(line)
+        if echo:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        if on_line is not None:
+            on_line(line)
+
+
 def run_streaming(
     command: Sequence[str],
-    *,
     log_path: Path,
-    dest: Path | None = None,
-    total: int = 0,
-    bar: ProgressBar | None = None,
+    *,
+    progress: ProgressTarget | None = None,
     echo: bool = True,
     on_line: Callable[[str], None] | None = None,
 ) -> int:
@@ -532,17 +814,27 @@ def run_streaming(
 
     The child gets its own process group so Ctrl-C reaches Wine and every
     helper process it spawned.
+
+    Args:
+        command: Command line to run under the unfit Wine prefix.
+        log_path: Log file the command and its output are appended to.
+        progress: Folder to measure for the progress line, if any.
+        echo: Copy the output to stdout.
+        on_line: Called with every output line.
+
+    Returns:
+        The command's exit code.
+
+    Raises:
+        UnfitError: When the output cannot be read.
     """
-    start = time.monotonic()
+    bar = progress.bar if progress is not None and progress.bar.enabled else None
     stop = threading.Event()
-
-    def watch() -> None:
-        if bar is None or not bar.enabled or dest is None:
-            return
-        while not stop.wait(PROGRESS_INTERVAL):
-            bar.render(directory_size(dest), total, "unpacking", start)
-
-    watcher = threading.Thread(target=watch, daemon=True)
+    watcher = (
+        threading.Thread(target=watch_progress, args=(progress, stop), daemon=True)
+        if bar is not None
+        else None
+    )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", errors="replace") as log:
         log.write(f"$ WINEPREFIX={PREFIX_DIR} {shlex.join(list(command))}\n")
@@ -557,37 +849,36 @@ def run_streaming(
             env=wine_environment(),
             start_new_session=True,
         )
-        watcher.start()
-        assert process.stdout is not None
+        if process.stdout is None:
+            process.kill()
+            raise UnfitError(f"cannot read the output of {command[0]}")
+        if watcher is not None:
+            watcher.start()
         try:
-            for line in process.stdout:
-                if bar is not None:
-                    bar.clear()
-                log.write(line)
-                if echo:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                if on_line is not None:
-                    on_line(line)
+            relay_output(process.stdout, log, bar=bar, echo=echo, on_line=on_line)
             returncode = process.wait()
         except KeyboardInterrupt:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            with contextlib.suppress(subprocess.TimeoutExpired, ProcessLookupError):
-                process.wait(timeout=30)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+            stop_process_group(process)
             raise
         finally:
             stop.set()
-            watcher.join(timeout=PROGRESS_INTERVAL + 1)
+            if watcher is not None:
+                watcher.join(timeout=PROGRESS_INTERVAL + 1)
             if bar is not None:
                 bar.clear()
     return returncode
 
 
 def verify_bins(pack: PackFiles, bar: ProgressBar) -> VerifyReport:
-    """Verify the ``.bin`` volumes against the repack's bins manifest."""
+    """Verify the ``.bin`` volumes against the repack's bins manifest.
+
+    Args:
+        pack: The repack.
+        bar: Progress renderer for hashing.
+
+    Returns:
+        Which volumes matched, differed or were missing.
+    """
     manifest = read_md5_manifest(pack.bins_manifest)
     report = verify_against_manifest(pack.pack_dir, manifest, bar)
     for relative in report.ok:
@@ -603,12 +894,26 @@ def verify_bins(pack: PackFiles, bar: ProgressBar) -> VerifyReport:
 
 
 def required_missing(report: VerifyReport) -> list[str]:
-    """Missing volumes that are not optional selective downloads."""
+    """Missing volumes that are not optional selective downloads.
+
+    Args:
+        report: Volume verification outcome.
+
+    Returns:
+        Missing volumes that block unpacking.
+    """
     return [relative for relative in report.missing if not is_selective(relative)]
 
 
 def destination_manifest(dest: Path) -> dict[str, str] | None:
-    """Read ``_Redist/fitgirl.md5`` from an unpacked folder, if it has one."""
+    """Read ``_Redist/fitgirl.md5`` from an unpacked folder, if it has one.
+
+    Args:
+        dest: Unpacked folder.
+
+    Returns:
+        The parsed manifest, or None when the folder has no manifest.
+    """
     manifest_path = dest / "_Redist/fitgirl.md5"
     if not manifest_path.is_file():
         return None
@@ -616,7 +921,11 @@ def destination_manifest(dest: Path) -> dict[str, str] | None:
 
 
 def repair_layout(dest: Path) -> None:
-    """Move manifest files that unpacked to the root into their subfolder."""
+    """Move manifest files that unpacked to the root into their subfolder.
+
+    Args:
+        dest: Unpacked folder.
+    """
     manifest = destination_manifest(dest)
     if manifest is None:
         return
@@ -630,6 +939,10 @@ def repair_layout(dest: Path) -> None:
 
 def post_extract_verify(dest: Path, bar: ProgressBar) -> int:
     """Repair misplaced files, then verify the destination against FitGirl's list.
+
+    Args:
+        dest: Unpacked folder.
+        bar: Progress renderer for hashing.
 
     Returns:
         Process exit code: 0 when everything verified, 1 otherwise.
@@ -664,6 +977,8 @@ SCRIPT_PLACEHOLDER = re.compile(r"^fitgirl\d*-path\\", re.IGNORECASE)
 SCRIPT_GLOB = re.compile(r"^build\d*\.bat$", re.IGNORECASE)
 POST_INSTALL_TOOLS = frozenset({"fgpack.exe", "x.exe", "raw.exe", "run.exe"})
 SYNC_TOOLS = frozenset({"countdown.exe"})
+WAIT_MARKER = re.compile(r'^if\s+not\s+exist\s+"?([^"\s]+)"?\s+goto\s', re.IGNORECASE)
+ECHO_REDIRECT = re.compile(r'>>?\s*"?([^"\s>]+)"?\s*$')
 TRASH_DIR = ".unfit-trash"
 SKIP_DIRS = frozenset({".fgtmp", TRASH_DIR})
 SCRIPT_SEARCH_DEPTH = 3
@@ -709,11 +1024,19 @@ class PostInstallContext:
     root: Path
     scripts_root: Path
     wine: Path
-    xdelta: Path | None
+    xdelta: Path
+    windows_root: str
 
 
 def split_cmd_words(text: str) -> list[str]:
-    """Split a ``cmd.exe`` command line into words, honouring double quotes."""
+    """Split a ``cmd.exe`` command line into words, honouring double quotes.
+
+    Args:
+        text: One command.
+
+    Returns:
+        The words with quotes removed; ``""`` gives an empty word.
+    """
     words: list[str] = []
     current: list[str] = []
     quoted = False
@@ -734,7 +1057,14 @@ def split_cmd_words(text: str) -> list[str]:
 
 
 def split_and_chain(text: str) -> list[str]:
-    """Split ``a && b && c`` on ``&&`` outside double quotes."""
+    """Split ``a && b && c`` on ``&&`` outside double quotes.
+
+    Args:
+        text: A command chain.
+
+    Returns:
+        The non-empty commands, stripped.
+    """
     parts: list[str] = []
     start = 0
     quoted = False
@@ -753,12 +1083,41 @@ def split_and_chain(text: str) -> list[str]:
 
 
 def is_placeholder_path(argument: str) -> bool:
-    """Return True for ``fitgirl2-path\\...`` arguments (the scripts folder)."""
+    r"""Return True for ``fitgirl2-path\...`` arguments (the scripts folder).
+
+    Args:
+        argument: One script argument.
+
+    Returns:
+        True when the argument starts with the scripts-folder placeholder.
+    """
     return bool(SCRIPT_PLACEHOLDER.match(argument))
 
 
+def strip_placeholder(argument: str) -> str:
+    r"""Drop a leading ``fitgirl2-path\`` so the rest is relative to the scripts root.
+
+    Args:
+        argument: One script argument.
+
+    Returns:
+        The argument without the placeholder; unchanged when it has none.
+    """
+    return SCRIPT_PLACEHOLDER.sub("", argument)
+
+
 def raw_options(args: Sequence[str]) -> tuple[list[str], dict[str, int]]:
-    """Split ``raw.exe`` arguments into positionals and ``-ioff/-ilen/-ooff``."""
+    """Split ``raw.exe`` arguments into positionals and ``-ioff/-ilen/-ooff``.
+
+    Args:
+        args: Arguments after ``raw.exe``.
+
+    Returns:
+        The positional arguments and the numeric options by name.
+
+    Raises:
+        UnfitError: For unknown options or options without a number.
+    """
     positional: list[str] = []
     options: dict[str, int] = {}
     for argument in args:
@@ -776,7 +1135,17 @@ def raw_options(args: Sequence[str]) -> tuple[list[str], dict[str, int]]:
 
 
 def xdelta_operands(args: Sequence[str]) -> tuple[str, str, str]:
-    """Return ``(source, patch, output)`` for an ``x.exe -d -s`` decode."""
+    """Return ``(source, patch, output)`` for an ``x.exe -d -s`` decode.
+
+    Args:
+        args: Arguments after ``x.exe``.
+
+    Returns:
+        The source file, the patch and the output file.
+
+    Raises:
+        UnfitError: When the arguments are not a ``-d -s`` decode.
+    """
     positional: list[str] = []
     source: str | None = None
     decode = False
@@ -796,7 +1165,17 @@ def xdelta_operands(args: Sequence[str]) -> tuple[str, str, str]:
 
 
 def step_files(step: Step) -> StepFiles:
-    """Validate a step and report the files it reads and writes."""
+    """Validate a step and report the files it reads and writes.
+
+    Args:
+        step: One parsed command.
+
+    Returns:
+        The files as written in the script.
+
+    Raises:
+        UnfitError: When the tool is unknown or its arguments do not fit.
+    """
     if step.tool == "del":
         return StepFiles((), ())
     if step.tool == "fgpack.exe":
@@ -817,16 +1196,30 @@ def step_files(step: Step) -> StepFiles:
 def check_script_path(argument: str) -> None:
     """Reject absolute paths and ``..`` so a script cannot leave the game folder.
 
+    Args:
+        argument: A file argument from a script.
+
     Raises:
         UnfitError: For paths that could point outside the destination.
     """
-    pure = PureWindowsPath(SCRIPT_PLACEHOLDER.sub("", argument))
+    pure = PureWindowsPath(strip_placeholder(argument))
     if pure.drive or pure.root or ".." in pure.parts or not pure.parts:
         raise UnfitError(f"path not allowed in a post-install script: {argument}")
 
 
 def parse_step(text: str, origin: str) -> Step:
-    """Turn one command into a :class:`Step`, rejecting anything unknown."""
+    """Turn one command into a :class:`Step`, rejecting anything unknown.
+
+    Args:
+        text: One command without ``&&``.
+        origin: ``script:line`` for error messages.
+
+    Returns:
+        The parsed step.
+
+    Raises:
+        UnfitError: For unknown programs, wildcards or unsafe paths.
+    """
     words = split_cmd_words(text)
     if not words:
         raise UnfitError(f"{origin}: empty command")
@@ -862,23 +1255,77 @@ def parse_step(text: str, origin: str) -> Step:
 
 
 def is_control_line(line: str) -> bool:
-    """Labels, gotos, ``if ... goto`` waits and marker echoes need no replay.
+    """Return True for lines that need no replay: labels, gotos and waits.
 
     FitGirl's scripts poll for each other's marker files because the installer
     starts them together; unfit runs them one after another instead.
+
+    Args:
+        line: One stripped script line.
+
+    Returns:
+        True for empty lines, comments, labels, ``goto`` and ``if ... goto``.
     """
     lowered = line.lower()
     return (
         not line
         or line.startswith(":")
         or lowered in {"rem", "@echo off", "echo off"}
-        or lowered.startswith(("rem ", "goto ", "echo ", "@rem "))
+        or lowered.startswith(("rem ", "goto ", "@rem "))
         or (lowered.startswith("if ") and " goto " in f"{lowered} ")
     )
 
 
+def wait_markers(scripts: Sequence[Path]) -> frozenset[str]:
+    """Collect the files scripts wait for with ``if not exist FILE goto``.
+
+    Args:
+        scripts: The ``build*.bat`` files of one pack.
+
+    Returns:
+        Lowercase file names that act as synchronisation markers.
+    """
+    markers: set[str] = set()
+    for script in scripts:
+        text = script.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            match = WAIT_MARKER.match(line.strip())
+            if match:
+                markers.add(PureWindowsPath(match.group(1)).name.lower())
+    return frozenset(markers)
+
+
+def check_echo(line: str, origin: str, markers: frozenset[str]) -> None:
+    """Accept an ``echo`` that only prints or writes a marker another script waits for.
+
+    Args:
+        line: One stripped script line starting with ``echo``.
+        origin: ``script:line`` for error messages.
+        markers: File names from :func:`wait_markers`.
+
+    Raises:
+        UnfitError: When the echo writes any other file, which unfit cannot replay.
+    """
+    match = ECHO_REDIRECT.search(line)
+    if match and PureWindowsPath(match.group(1)).name.lower() not in markers:
+        raise UnfitError(f"{origin}: echo writes a file unfit does not replay: {line}")
+
+
 def parse_chain_text(line: str, origin: str) -> list[Step]:
-    """Parse ``cmd /c "a && b"`` or a plain command into steps."""
+    """Parse ``cmd /c "a && b"`` or a plain command into steps.
+
+    Deletes that only target the scripts folder are dropped.
+
+    Args:
+        line: One script line.
+        origin: ``script:line`` for error messages.
+
+    Returns:
+        The steps in order; empty when nothing is left to run.
+
+    Raises:
+        UnfitError: From :func:`parse_step`.
+    """
     text = line.strip()
     if text.lower().startswith("cmd /c "):
         text = text[7:].strip()
@@ -888,8 +1335,18 @@ def parse_chain_text(line: str, origin: str) -> list[Step]:
     return [step for step in steps if step.tool != "del" or step.args]
 
 
-def parse_post_install_script(script: Path, scripts_root: Path) -> list[Batch]:
+def parse_post_install_script(
+    script: Path, scripts_root: Path, markers: frozenset[str]
+) -> list[Batch]:
     """Parse one ``build*.bat`` into batches, expanding ``run.exe`` lists.
+
+    Args:
+        script: The batch file to parse.
+        scripts_root: Folder the ``fitgirl2-path`` placeholder stands for.
+        markers: Wait-marker file names from :func:`wait_markers`.
+
+    Returns:
+        The script's batches in order.
 
     Raises:
         UnfitError: On any command unfit does not know how to replay.
@@ -900,6 +1357,9 @@ def parse_post_install_script(script: Path, scripts_root: Path) -> list[Batch]:
         line = raw_line.strip()
         origin = f"{script.name}:{number}"
         if is_control_line(line):
+            continue
+        if line.lower().startswith(("echo ", "@echo ")):
+            check_echo(line, origin, markers)
             continue
         steps = parse_chain_text(line, origin)
         if not steps or (len(steps) == 1 and steps[0].tool in SYNC_TOOLS):
@@ -917,13 +1377,23 @@ def parse_post_install_script(script: Path, scripts_root: Path) -> list[Batch]:
 
 
 def parse_run_list(step: Step, origin: str, scripts_root: Path) -> Batch:
-    """Expand ``run.exe " " URL LISTFILE N``: one chain per list line."""
+    """Expand ``run.exe " " URL LISTFILE N``: one chain per list line.
+
+    Args:
+        step: The parsed ``run.exe`` step.
+        origin: ``script:line`` for error messages.
+        scripts_root: Folder the ``fitgirl2-path`` placeholder stands for.
+
+    Returns:
+        A parallel batch with one chain per non-empty list line.
+
+    Raises:
+        UnfitError: When the list is missing or holds unsupported commands.
+    """
     lists = [arg for arg in step.args if is_placeholder_path(arg)]
     if len(lists) != 1:
         raise UnfitError(f"{origin}: cannot find the command list for run.exe")
-    list_path = resolve_case_insensitive(
-        scripts_root, SCRIPT_PLACEHOLDER.sub("", lists[0])
-    )
+    list_path = resolve_case_insensitive(scripts_root, strip_placeholder(lists[0]))
     if not list_path.is_file():
         raise UnfitError(f"{origin}: run.exe list {lists[0]} is missing")
     chains: list[Chain] = []
@@ -947,6 +1417,13 @@ def resolve_case_insensitive(base: Path, relative: str) -> Path:
 
     Existing components are matched without regard to case; missing ones are
     kept as written so outputs can be created.
+
+    Args:
+        base: Folder the path is relative to.
+        relative: Windows-style relative path.
+
+    Returns:
+        The resolved path, which may not exist yet.
 
     Raises:
         UnfitError: For absolute paths or ``..`` components.
@@ -973,6 +1450,9 @@ def resolve_case_insensitive(base: Path, relative: str) -> Path:
 
 def find_post_install_scripts(root: Path) -> tuple[Path, list[Path]] | None:
     """Locate the ``work`` folder holding ``build*.bat`` scripts.
+
+    Args:
+        root: Unpacked folder.
 
     Returns:
         ``(scripts_root, scripts)`` where ``scripts_root`` is what the
@@ -1022,7 +1502,14 @@ class FileIndex:
                 self._by_name.setdefault(filename.lower(), []).append(relative)
 
     def folders_holding(self, relative: str) -> set[str]:
-        """Folders ``d`` (relative to root) where ``d/relative`` is a file."""
+        """Folders ``d`` (relative to root) where ``d/relative`` is a file.
+
+        Args:
+            relative: Windows-style relative path from a script.
+
+        Returns:
+            Matching folders relative to the root; ``""`` stands for the root.
+        """
         parts = [part.lower() for part in PureWindowsPath(relative).parts]
         if not parts:
             return set()
@@ -1038,7 +1525,14 @@ class FileIndex:
 
 
 def chain_probes(chain: Chain) -> list[str]:
-    """Inputs a chain needs that no earlier step of the same chain creates."""
+    """Return the inputs a chain needs that no earlier step creates.
+
+    Args:
+        chain: The chain to inspect.
+
+    Returns:
+        The input paths as written in the script.
+    """
     produced: set[str] = set()
     probes: list[str] = []
     for step in chain.steps:
@@ -1053,57 +1547,125 @@ def chain_probes(chain: Chain) -> list[str]:
     return probes
 
 
-def locate_chain(index: FileIndex, chain: Chain) -> str | None:
-    """Find the working folder a chain was written for.
+def chain_folders(index: FileIndex, chain: Chain) -> set[str]:
+    """Find every folder a chain could have been written for.
 
     The installer starts each script in a folder the script never names, so
-    the folder is the unique one that holds every input the chain reads.
+    a candidate is a folder that holds every input the chain reads.
     Delete-only chains use whichever of their targets still exist.
 
-    Returns:
-        The folder relative to the destination, or None when the inputs are
-        gone (typically because the chain already ran).
+    Args:
+        index: Files under the destination.
+        chain: The chain to place.
 
-    Raises:
-        UnfitError: When several folders fit.
+    Returns:
+        Candidate folders relative to the destination; empty when the inputs
+        are gone (typically because the chain already ran).
     """
     probes = chain_probes(chain)
     if probes:
         sets = [index.folders_holding(probe) for probe in probes]
     else:
-        targets = [
-            target
-            for step in chain.steps
-            for target in step.args
-            if not is_placeholder_path(target)
-        ]
+        targets = [target for step in chain.steps for target in step.args]
         sets = [found for found in map(index.folders_holding, targets) if found]
-    if not sets:
-        return None
-    common = set.intersection(*sets)
-    if not common:
-        return None
-    if len(common) > 1:
-        listing = ", ".join(sorted(folder or "." for folder in common))
+    return set.intersection(*sets) if sets else set()
+
+
+def locate_chain(index: FileIndex, chain: Chain) -> str | None:
+    """Find the one working folder a chain was written for.
+
+    Args:
+        index: Files under the destination.
+        chain: The chain to place.
+
+    Returns:
+        The folder relative to the destination, or None when the inputs are
+        gone.
+
+    Raises:
+        UnfitError: When several folders fit.
+    """
+    folders = chain_folders(index, chain)
+    if len(folders) > 1:
+        listing = ", ".join(sorted(folder or "." for folder in folders))
         raise UnfitError(f"{chain.origin}: inputs found in several folders: {listing}")
-    return common.pop()
+    return folders.pop() if folders else None
 
 
 def probes_exist(folder: Path, chain: Chain) -> bool:
-    """Check a located folder against the disk, in case the index is stale."""
+    """Check a located folder against the disk, in case the index is stale.
+
+    Args:
+        folder: Candidate working folder.
+        chain: The chain to place.
+
+    Returns:
+        True when every input of the chain exists in ``folder``.
+    """
     return all(
         resolve_case_insensitive(folder, probe).is_file()
         for probe in chain_probes(chain)
     )
 
 
-def to_wine_path(path: Path) -> str:
-    """Spell a Linux path the way Wine's default ``Z:`` drive exposes it."""
-    return "Z:" + str(path).replace("/", "\\")
+def windows_path(wine: Path, path: Path) -> str:
+    r"""Ask Wine how a Linux path looks to Windows programs.
+
+    Args:
+        wine: The Wine binary.
+        path: An absolute Linux path.
+
+    Returns:
+        The Windows spelling, e.g. ``Z:\games\pack``.
+
+    Raises:
+        UnfitError: When ``winepath`` fails or prints nothing.
+    """
+    result = subprocess.run(
+        [str(wine), "winepath.exe", "-w", str(path)],
+        env=wine_environment(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
+    lines = result.stdout.strip().splitlines()
+    if result.returncode != 0 or not lines:
+        raise UnfitError(f"winepath cannot map {path}: {result.stderr.strip()}")
+    return lines[-1].strip()
+
+
+def remove_tree(path: Path) -> bool:
+    """Delete a folder, logging instead of hiding a failure.
+
+    Args:
+        path: Folder to delete; a missing folder counts as removed.
+
+    Returns:
+        True when the folder is gone.
+    """
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        LOGGER.warning("could not remove %s: %s", path, error)
+        return False
+    return True
 
 
 def raw_copy(source: Path, target: Path, options: Mapping[str, int]) -> None:
-    """Do what ``raw.exe IN OUT -ioff -ilen -ooff`` does, without truncating OUT."""
+    """Do what ``raw.exe IN OUT -ioff -ilen -ooff`` does, without truncating OUT.
+
+    Args:
+        source: File to read.
+        target: File to write into; created when missing.
+        options: ``ioff``, ``ilen`` and ``ooff`` in bytes.
+
+    Raises:
+        UnfitError: When the source is shorter than the requested range.
+    """
     input_offset = options.get("ioff", 0)
     output_offset = options.get("ooff", 0)
     remaining = options.get("ilen", max(source.stat().st_size - input_offset, 0))
@@ -1120,7 +1682,16 @@ def raw_copy(source: Path, target: Path, options: Mapping[str, int]) -> None:
 
 
 def run_tool(command: Sequence[str], cwd: Path, *, wine: bool) -> None:
-    """Run one helper program and raise with its output when it fails."""
+    """Run one helper program and raise with its output when it fails.
+
+    Args:
+        command: Command line; under Wine the second item is the program.
+        cwd: Working folder.
+        wine: Run with the unfit Wine environment.
+
+    Raises:
+        UnfitError: When the program exits with a non-zero code.
+    """
     result = subprocess.run(
         list(command),
         cwd=cwd,
@@ -1150,10 +1721,20 @@ class ChainRunner:
         self._deleted = 0
 
     def path(self, argument: str) -> Path:
-        """Resolve a script argument and make sure it stays inside the game."""
+        """Resolve a script argument and make sure it stays inside the game.
+
+        Args:
+            argument: A file argument from the script.
+
+        Returns:
+            The resolved path below the destination.
+
+        Raises:
+            UnfitError: When the path would leave the destination.
+        """
         if is_placeholder_path(argument):
             base = self._context.scripts_root
-            relative = SCRIPT_PLACEHOLDER.sub("", argument)
+            relative = strip_placeholder(argument)
         else:
             base, relative = self._cwd, argument
         resolved = resolve_case_insensitive(base, relative)
@@ -1163,8 +1744,27 @@ class ChainRunner:
             raise UnfitError(f"post-install path leaves the destination: {argument}")
         return resolved
 
+    def windows(self, path: Path) -> str:
+        """Spell a path inside the destination for a program running under Wine.
+
+        Args:
+            path: A path below the destination.
+
+        Returns:
+            The Windows spelling, based on what ``winepath`` reported for the root.
+        """
+        relative = path.relative_to(self._context.root)
+        return "\\".join([self._context.windows_root, *relative.parts])
+
     def run(self, chain: Chain) -> None:
-        """Run every step; on success, drop the files the chain deleted."""
+        """Run every step; on success, drop the files the chain deleted.
+
+        Args:
+            chain: The chain to run.
+
+        Raises:
+            UnfitError: When a step fails; deleted files stay in the trash folder.
+        """
         for step in chain.steps:
             try:
                 self.run_step(step)
@@ -1172,10 +1772,17 @@ class ChainRunner:
                 kept = f"; deleted files kept in {self._trash}" if self._deleted else ""
                 raise UnfitError(f"{chain.origin}: {error}{kept}") from error
         if self._deleted:
-            shutil.rmtree(self._trash, ignore_errors=True)
+            remove_tree(self._trash)
 
     def run_step(self, step: Step) -> None:
-        """Replay one command."""
+        """Replay one command.
+
+        Args:
+            step: The command to replay.
+
+        Raises:
+            UnfitError: When the command fails or is not supported.
+        """
         if step.tool == "del":
             self.delete(step.args)
         elif step.tool == "raw.exe":
@@ -1186,9 +1793,9 @@ class ChainRunner:
             run_tool(
                 [
                     str(self._context.wine),
-                    to_wine_path(self.path(step.exe)),
-                    to_wine_path(source),
-                    to_wine_path(target),
+                    self.windows(self.path(step.exe)),
+                    self.windows(source),
+                    self.windows(target),
                 ],
                 self._cwd,
                 wine=True,
@@ -1201,27 +1808,29 @@ class ChainRunner:
             raise UnfitError(f"unsupported post-install tool {step.tool}")
 
     def xdelta(self, step: Step) -> None:
-        """Apply an xdelta3 patch, natively when ``xdelta3`` is installed."""
+        """Apply an xdelta3 patch with the native ``xdelta3``.
+
+        Args:
+            step: The ``x.exe`` step.
+
+        Raises:
+            UnfitError: When the patch does not apply.
+        """
         source, patch, output = (self.path(arg) for arg in xdelta_operands(step.args))
-        if self._context.xdelta is not None:
-            command = [str(self._context.xdelta), "-f", "-d", "-s"]
-            command += [str(source), str(patch), str(output)]
-            run_tool(command, self._cwd, wine=False)
-        else:
-            command = [str(self._context.wine), to_wine_path(self.path(step.exe))]
-            command += ["-f", "-d", "-s"]
-            command += [to_wine_path(path) for path in (source, patch, output)]
-            run_tool(command, self._cwd, wine=True)
+        command = [str(self._context.xdelta), "-f", "-d", "-s"]
+        command += [str(source), str(patch), str(output)]
+        run_tool(command, self._cwd, wine=False)
 
     def delete(self, targets: Sequence[str]) -> None:
         """Move deleted files aside; they are removed once the chain succeeds.
 
-        Files in the scripts folder are left alone so the scripts can be
-        replayed again with ``--finish``.
+        Targets in the scripts folder never get here: :func:`parse_step` drops
+        them so the scripts stay available for ``--finish``.
+
+        Args:
+            targets: Files to delete, as written in the script.
         """
         for target in targets:
-            if is_placeholder_path(target):
-                continue
             path = self.path(target)
             if not path.is_file():
                 continue
@@ -1241,35 +1850,82 @@ class PostInstallTally:
     skipped: int = 0
 
 
-def run_batch(
+class PlannedChain(NamedTuple):
+    """A chain with its position in the batch and its working folder."""
+
+    number: int
+    chain: Chain
+    cwd: Path
+
+
+def plan_batch(
     context: PostInstallContext,
     batch: Batch,
     index: FileIndex,
     tally: PostInstallTally,
-    workers: int,
-) -> FileIndex:
-    """Run one batch and return a file index that is fresh enough to reuse."""
-    planned: list[tuple[int, Chain, Path]] = []
+) -> tuple[list[PlannedChain], FileIndex]:
+    """Find the working folder of every chain in a batch.
+
+    The index is rebuilt when it cannot place a chain, since earlier chains
+    may have created or removed files since it was built.
+
+    Args:
+        context: Destination and helper programs.
+        batch: The batch to plan.
+        index: Files under the destination, possibly stale.
+        tally: Counts chains with nothing left to do.
+
+    Returns:
+        The runnable chains and the index to reuse for the next batch.
+
+    Raises:
+        UnfitError: When a chain fits several folders.
+    """
+    planned: list[PlannedChain] = []
     for number, chain in enumerate(batch.chains):
-        try:
-            folder = locate_chain(index, chain)
-        except UnfitError:
-            folder = None
-        if folder is None or not probes_exist(context.root / folder, chain):
+        folders = chain_folders(index, chain)
+        usable = len(folders) == 1 and probes_exist(
+            context.root / next(iter(folders)), chain
+        )
+        if not usable:
             index = FileIndex(context.root)
-            folder = locate_chain(index, chain)
+        folder = locate_chain(index, chain)
         if folder is None:
             tally.skipped += 1
             continue
-        planned.append((number, chain, context.root / folder))
+        planned.append(PlannedChain(number, chain, context.root / folder))
+    return planned, index
 
+
+def execute_batch(
+    context: PostInstallContext,
+    batch: Batch,
+    planned: Sequence[PlannedChain],
+    tally: PostInstallTally,
+    workers: int,
+) -> None:
+    """Run planned chains, in parallel when the batch came from a run list.
+
+    Args:
+        context: Destination and helper programs.
+        batch: The batch the chains belong to.
+        planned: Chains with their working folders.
+        tally: Counts the chains that ran.
+        workers: Parallel chains for run lists.
+
+    Raises:
+        UnfitError: From the first chain that fails; pending chains are cancelled.
+    """
     trash_root = context.root / TRASH_DIR
 
-    def execute(item: tuple[int, Chain, Path]) -> Chain:
-        number, chain, cwd = item
-        trash = trash_root / f"{batch.origin.replace(':', '-')}-{number}"
-        ChainRunner(context, cwd, trash).run(chain)
-        return chain
+    def execute(item: PlannedChain) -> None:
+        """Run one planned chain with its own trash folder.
+
+        Args:
+            item: The chain and its working folder.
+        """
+        trash = trash_root / f"{batch.origin.replace(':', '-')}-{item.number}"
+        ChainRunner(context, item.cwd, trash).run(item.chain)
 
     if not batch.parallel or len(planned) <= 1:
         for item in planned:
@@ -1277,10 +1933,10 @@ def run_batch(
             tally.ran += 1
     else:
         print(f"  {batch.origin}: {len(planned)} commands in parallel", flush=True)
-        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(execute, item) for item in planned]
             try:
-                for done, future in enumerate(cf.as_completed(futures), 1):
+                for done, future in enumerate(as_completed(futures), 1):
                     future.result()
                     tally.ran += 1
                     if done % 25 == 0 or done == len(futures):
@@ -1289,9 +1945,36 @@ def run_batch(
                 for future in futures:
                     future.cancel()
                 raise
-        index = FileIndex(context.root)
-    with contextlib.suppress(OSError):
+    if trash_root.is_dir() and not any(trash_root.iterdir()):
         trash_root.rmdir()
+
+
+def run_batch(
+    context: PostInstallContext,
+    batch: Batch,
+    index: FileIndex,
+    tally: PostInstallTally,
+    workers: int,
+) -> FileIndex:
+    """Plan and run one batch.
+
+    Args:
+        context: Destination and helper programs.
+        batch: The batch to run.
+        index: Files under the destination, possibly stale.
+        tally: Counts chains that ran or were skipped.
+        workers: Parallel chains for run lists.
+
+    Returns:
+        A file index that is fresh enough to reuse for the next batch.
+
+    Raises:
+        UnfitError: When a chain cannot be placed or fails.
+    """
+    planned, index = plan_batch(context, batch, index, tally)
+    execute_batch(context, batch, planned, tally, workers)
+    if batch.parallel and len(planned) > 1:
+        index = FileIndex(context.root)
     return index
 
 
@@ -1301,30 +1984,58 @@ def run_post_install(dest: Path, wine: Path, *, workers: int | None = None) -> i
     Every script is parsed before anything runs, so an unsupported command
     leaves the destination untouched.
 
+    Args:
+        dest: Unpacked folder.
+        wine: Wine binary for helpers that only exist as Windows programs.
+        workers: Parallel chains for run lists; half the CPU threads by default.
+
     Returns:
         0 when there was nothing to do or everything ran, 1 on failure.
+
+    Raises:
+        UnfitError: When the scripts need ``xdelta3`` and it is not installed.
     """
     try:
         found = find_post_install_scripts(dest)
         if found is None:
             return 0
         scripts_root, scripts = found
+        markers = wait_markers(scripts)
         parsed = [
-            (script, parse_post_install_script(script, scripts_root))
+            (script, parse_post_install_script(script, scripts_root, markers))
             for script in scripts
         ]
     except UnfitError as error:
-        print(f"post-install: not replayed, {error}")
+        LOGGER.error("post-install: not replayed, %s", error)
         return 1
 
+    xdelta = shutil.which("xdelta3")
+    needs_xdelta = any(
+        step.tool == "x.exe"
+        for _, batches in parsed
+        for batch in batches
+        for chain in batch.chains
+        for step in chain.steps
+    )
+    if xdelta is None and needs_xdelta:
+        rerun = shlex.join(["unfit", "--finish", str(dest)])
+        raise UnfitError(
+            "xdelta3 is missing; this pack's post-install scripts apply xdelta "
+            f"patches. Install xdelta3, then run: {rerun}"
+        )
     names = ", ".join(script.name for script in scripts)
     print(f"post-install: replaying {names} from {scripts_root.relative_to(dest)}")
-    xdelta = shutil.which("xdelta3")
+    try:
+        windows_root = windows_path(wine, dest)
+    except UnfitError as error:
+        LOGGER.error("post-install: not replayed, %s", error)
+        return 1
     context = PostInstallContext(
         root=dest,
         scripts_root=scripts_root,
         wine=wine,
-        xdelta=Path(xdelta) if xdelta else None,
+        xdelta=Path(xdelta or "xdelta3"),
+        windows_root=windows_root,
     )
     tally = PostInstallTally()
     index = FileIndex(dest)
@@ -1339,7 +2050,7 @@ def run_post_install(dest: Path, wine: Path, *, workers: int | None = None) -> i
                     workers or max(1, (os.cpu_count() or 2) // 2),
                 )
     except UnfitError as error:
-        print(f"post-install: FAILED at {error}")
+        LOGGER.error("post-install: failed at %s", error)
         return 1
     summary = f"post-install: {tally.ran} command chain(s) ran"
     if tally.skipped:
@@ -1348,15 +2059,32 @@ def run_post_install(dest: Path, wine: Path, *, workers: int | None = None) -> i
     return 0
 
 
-def check_destination(pack_dir: Path, dest: Path, overwrite: bool) -> None:
-    """Reject a destination inside the pack and a folder that already has files."""
+def check_destination(pack_dir: Path, dest: Path, *, overwrite: bool) -> None:
+    """Reject a destination inside the pack and a folder that already has files.
+
+    Args:
+        pack_dir: The repack folder.
+        dest: Destination folder.
+        overwrite: Allow a non-empty destination.
+
+    Raises:
+        UnfitError: When the destination is inside the pack or not empty.
+    """
     if dest == pack_dir or pack_dir in dest.parents:
         raise UnfitError(f"destination is inside the pack: {dest}")
-    confirm_overwrite(dest, overwrite)
+    confirm_overwrite(dest, overwrite=overwrite)
 
 
-def confirm_overwrite(dest: Path, overwrite: bool) -> None:
-    """Refuse to unpack into a folder that already holds files."""
+def confirm_overwrite(dest: Path, *, overwrite: bool) -> None:
+    """Refuse to unpack into a folder that already holds files.
+
+    Args:
+        dest: Destination folder.
+        overwrite: Allow a non-empty destination.
+
+    Raises:
+        UnfitError: When the folder has files and ``overwrite`` is False.
+    """
     if overwrite or not dest.exists():
         return
     if any(dest.iterdir()):
@@ -1364,36 +2092,51 @@ def confirm_overwrite(dest: Path, overwrite: bool) -> None:
 
 
 def log_path_for(pack: PackFiles) -> Path:
-    """Build a timestamped log file path for this run."""
+    """Build a timestamped log file path for this run.
+
+    Args:
+        pack: The repack.
+
+    Returns:
+        A path under the state folder's ``logs``.
+    """
     stamp = time.strftime("%Y%m%d-%H%M%S")
     return STATE_DIR / "logs" / f"{stamp}-{derive_dest_name(pack.pack_dir)[:40]}.log"
 
 
 def run_check(pack: PackFiles, bar: ProgressBar) -> int:
-    """Verify the ``.bin`` volumes and report the result."""
+    """Verify the ``.bin`` volumes and report the result.
+
+    Args:
+        pack: The repack.
+        bar: Progress renderer for hashing.
+
+    Returns:
+        0 when every required volume matched, 1 otherwise.
+    """
     report = verify_bins(pack, bar)
     print(f"bins: {describe_report(report, selective_missing=True)}")
     return 1 if report.bad or required_missing(report) else 0
 
 
 def run_list(
-    pack: PackFiles,
-    tools: Toolchain,
-    *,
-    log_path: Path,
-    verbose: bool,
-    echo: bool,
+    pack: PackFiles, tools: Toolchain, log_path: Path, *, verbose: bool, echo: bool
 ) -> int:
-    """Ask the extractor for the archive listing."""
-    command = build_extract_command(
-        tools.wine,
-        tools.extractor,
-        pack.pack_dir,
-        None,
-        list_only=True,
-        verbose=verbose,
-    )
-    return run_streaming(command, log_path=log_path, echo=echo)
+    """Ask the extractor for the archive listing.
+
+    Args:
+        pack: The repack.
+        tools: Wine and the extractor.
+        log_path: Run log.
+        verbose: Ask the extractor for per-file detail.
+        echo: Show the listing.
+
+    Returns:
+        The extractor's exit code.
+    """
+    flags = ExtractFlags(list_only=True, verbose=verbose)
+    command = build_extract_command(tools, pack.pack_dir, None, flags)
+    return run_streaming(command, log_path, echo=echo)
 
 
 # --- installer tools shipped in a volume --------------------------------------
@@ -1461,14 +2204,26 @@ class ArcIniCatcher:
 
 
 def collect_failed_volume(line: str, failed: list[str]) -> None:
-    """Record volumes the extractor reports as failed."""
+    """Record volumes the extractor reports as failed.
+
+    Args:
+        line: One line of extractor output.
+        failed: Receives each failed volume once.
+    """
     match = FAILED_VOLUME.match(line.strip())
     if match and match.group(1) not in failed:
         failed.append(match.group(1))
 
 
 def parse_arc_tool_dirs(text: str) -> set[str]:
-    """Folders that arc.ini runs external tools from (``tools\\xtool.exe``)."""
+    r"""Folders that arc.ini runs external tools from (``tools\xtool.exe``).
+
+    Args:
+        text: Content of ``arc.ini``.
+
+    Returns:
+        First path components of relative ``unpackcmd`` programs.
+    """
     folders: set[str] = set()
     for match in UNPACK_COMMAND.finditer(text):
         program = PureWindowsPath(match.group(1).strip('"'))
@@ -1484,6 +2239,13 @@ def find_tool_dirs(dest: Path, names: set[str]) -> list[Path]:
 
     A folder that ``_Redist/fitgirl.md5`` lists files in belongs to the game
     and is never treated as a tool folder.
+
+    Args:
+        dest: Unpacked folder.
+        names: Folder names from :func:`parse_arc_tool_dirs`.
+
+    Returns:
+        Matching folders, sorted.
     """
     wanted = {name.lower() for name in names}
     if not wanted or not dest.is_dir():
@@ -1504,190 +2266,296 @@ def remove_tool_dirs(dest: Path, tool_dirs: Sequence[Path]) -> None:
 
     Only done when ``_Redist/fitgirl.md5`` exists, since that is what shows
     the folders are not part of the game.
+
+    Args:
+        dest: Unpacked folder.
+        tool_dirs: Folders from :func:`find_tool_dirs`.
     """
     if not tool_dirs or destination_manifest(dest) is None:
         return
-    for folder in tool_dirs:
-        shutil.rmtree(folder, ignore_errors=True)
-    names = ", ".join(f"{folder.name}\\" for folder in tool_dirs)
-    print(f"removed installer tools {names} from the game folder")
+    removed = [folder for folder in tool_dirs if remove_tree(folder)]
+    if removed:
+        names = ", ".join(f"{folder.name}\\" for folder in removed)
+        print(f"removed installer tools {names} from the game folder")
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractSession:
+    """Everything one extraction run needs once the unpacked size is known."""
+
+    pack: PackFiles
+    tools: Toolchain
+    options: RunOptions
+    progress: ProgressTarget
+
+    def unpack(self, extractor: Path, only: tuple[str, ...], failed: list[str]) -> int:
+        """Run the extractor on the selected volumes (all when ``only`` is empty).
+
+        Args:
+            extractor: The ``fitgirl-extractor.exe`` to run.
+            only: Volumes to unpack.
+            failed: Receives the volumes the extractor reports as failed.
+
+        Returns:
+            The extractor's exit code.
+        """
+        flags = ExtractFlags(
+            skip_bin_check=True,
+            skip_verify=True,
+            verbose=self.options.verbose,
+            only=only,
+        )
+        tools = dataclasses.replace(self.tools, extractor=extractor)
+        command = build_extract_command(
+            tools, self.pack.pack_dir, self.options.dest, flags
+        )
+        return run_streaming(
+            command,
+            self.options.log_path,
+            progress=self.progress,
+            echo=self.options.echo,
+            on_line=functools.partial(collect_failed_volume, failed=failed),
+        )
 
 
 def retry_with_tools(
-    pack: PackFiles,
-    tools: Toolchain,
-    options: RunOptions,
-    bar: ProgressBar,
-    total: int,
-    *,
-    failed: Sequence[str],
-    tool_dirs: Sequence[Path],
+    session: ExtractSession, failed: Sequence[str], tool_dirs: Sequence[Path]
 ) -> int:
     """Unpack failed volumes again, with the tool folders next to the extractor.
 
+    Args:
+        session: The extraction run.
+        failed: Volumes that failed the first time.
+        tool_dirs: Unpacked tool folders that arc.ini runs programs from.
+
     Returns:
         0 when every retried volume unpacked, 1 otherwise.
+
+    Raises:
+        UnfitError: When the staging folder cannot be prepared.
     """
-    staging = options.dest / TOOL_STAGING_DIR
-    shutil.rmtree(staging, ignore_errors=True)
+    staging = session.options.dest / TOOL_STAGING_DIR
+    if not remove_tree(staging):
+        raise UnfitError(f"cannot clear {staging} for the retry")
     staging.mkdir()
     names = ", ".join(f"{folder.name}\\" for folder in tool_dirs)
     still_failed: list[str] = []
     try:
-        extractor = staging / tools.extractor.name
-        shutil.copy2(tools.extractor, extractor)
+        extractor = staging / session.tools.extractor.name
+        shutil.copy2(session.tools.extractor, extractor)
         for folder in tool_dirs:
             shutil.copytree(folder, staging / folder.name)
         for volume in failed:
             print(f"retrying {volume} with the installer tools {names}")
             again: list[str] = []
-            command = build_extract_command(
-                tools.wine,
-                extractor,
-                pack.pack_dir,
-                options.dest,
-                skip_bin_check=True,
-                skip_verify=True,
-                verbose=options.verbose,
-                only=[volume],
-            )
-            code = run_streaming(
-                command,
-                log_path=options.log_path,
-                dest=options.dest,
-                total=total,
-                bar=bar,
-                echo=options.echo,
-                on_line=functools.partial(collect_failed_volume, failed=again),
-            )
+            code = session.unpack(extractor, (volume,), again)
             if code != 0 or again:
                 still_failed.append(volume)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        remove_tree(staging)
     if still_failed:
-        print(f"still failing with the installer tools: {', '.join(still_failed)}")
+        LOGGER.error(
+            "still failing with the installer tools: %s", ", ".join(still_failed)
+        )
         return 1
     return 0
 
 
-def run_extract(
-    pack: PackFiles,
-    tools: Toolchain,
-    options: RunOptions,
-    bar: ProgressBar,
-) -> int:
-    """Run the full extract flow: verify bins, check space, unpack, verify."""
-    if not options.skip_md5:
-        report = verify_bins(pack, bar)
-        print(f"bins: {describe_report(report, selective_missing=True)}")
-        missing = required_missing(report)
-        if report.bad:
-            raise UnfitError(
-                "volume checksum mismatch - delete and re-download those files"
-            )
-        if missing:
-            raise UnfitError(f"missing volumes: {', '.join(missing)}")
+def check_volumes(pack: PackFiles, bar: ProgressBar) -> None:
+    """Verify the ``.bin`` volumes before unpacking.
 
-    listing_command = build_extract_command(
-        tools.wine, tools.extractor, pack.pack_dir, None, list_only=True
+    Args:
+        pack: The repack.
+        bar: Progress renderer for hashing.
+
+    Raises:
+        UnfitError: When a volume is damaged or a required one is missing.
+    """
+    report = verify_bins(pack, bar)
+    print(f"bins: {describe_report(report, selective_missing=True)}")
+    if report.bad:
+        raise UnfitError(
+            "volume checksum mismatch - delete and re-download those files"
+        )
+    missing = required_missing(report)
+    if missing:
+        raise UnfitError(f"missing volumes: {', '.join(missing)}")
+
+
+def measure_unpacked_size(pack: PackFiles, tools: Toolchain, log_path: Path) -> int:
+    """Ask the extractor how many bytes the volumes unpack to.
+
+    Args:
+        pack: The repack.
+        tools: Wine and the extractor.
+        log_path: Run log.
+
+    Returns:
+        The unpacked size in bytes.
+
+    Raises:
+        UnfitError: When the listing fails or reports nothing.
+    """
+    listing: list[str] = []
+    command = build_extract_command(
+        tools, pack.pack_dir, None, ExtractFlags(list_only=True)
     )
-    listing_parts: list[str] = []
-    listing_code = run_streaming(
-        listing_command,
-        log_path=options.log_path,
-        echo=False,
-        on_line=listing_parts.append,
-    )
-    total = parse_unpacked_bytes("".join(listing_parts))
-    if listing_code != 0 or total <= 0:
+    code = run_streaming(command, log_path, echo=False, on_line=listing.append)
+    total = parse_unpacked_bytes("".join(listing))
+    if code != 0 or total <= 0:
         raise UnfitError(
             "cannot read the archive listing; run `unfit --list` to see why"
         )
+    return total
 
-    options.dest.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(options.dest).free
+
+def ensure_free_space(dest: Path, total: int) -> None:
+    """Create the destination and check it can hold the unpacked volumes.
+
+    Args:
+        dest: Destination folder.
+        total: Unpacked size in bytes.
+
+    Raises:
+        UnfitError: When the disk is too full.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(dest).free
     needed = total + SPACE_MARGIN
     if free < needed:
         raise UnfitError(
-            f"not enough space on {options.dest}: "
+            f"not enough space on {dest}: "
             f"need {needed / 1024**3:.1f} GiB, have {free / 1024**3:.1f} GiB"
         )
 
-    command = build_extract_command(
-        tools.wine,
-        tools.extractor,
-        pack.pack_dir,
-        options.dest,
-        skip_bin_check=True,
-        skip_verify=True,
-        verbose=options.verbose,
-    )
-    print(
-        f"unpacking {len(pack.bins)} volume(s), {total / 1024**3:.2f} GiB "
-        f"into {options.dest}"
-    )
+
+def unpack_volumes(session: ExtractSession) -> int:
+    """Unpack every volume, retrying those that need tools from another volume.
+
+    Args:
+        session: The extraction run.
+
+    Returns:
+        0 when every volume unpacked, otherwise the failing exit code.
+    """
+    dest = session.options.dest
     failed: list[str] = []
-    with ArcIniCatcher(options.dest) as catcher:
-        code = run_streaming(
-            command,
-            log_path=options.log_path,
-            dest=options.dest,
-            total=total,
-            bar=bar,
-            echo=options.echo,
-            on_line=functools.partial(collect_failed_volume, failed=failed),
-        )
+    with ArcIniCatcher(dest) as catcher:
+        code = session.unpack(session.tools.extractor, (), failed)
     tool_dirs = (
-        find_tool_dirs(options.dest, parse_arc_tool_dirs(catcher.text))
-        if catcher.text
-        else []
+        find_tool_dirs(dest, parse_arc_tool_dirs(catcher.text)) if catcher.text else []
     )
     if failed and tool_dirs:
-        code = retry_with_tools(
-            pack, tools, options, bar, total, failed=failed, tool_dirs=tool_dirs
-        )
+        code = retry_with_tools(session, failed, tool_dirs)
     elif failed:
-        print(
-            "note: no installer tool folders from arc.ini were unpacked, "
+        LOGGER.warning(
+            "no installer tool folders from arc.ini were unpacked, "
             "so the failed volume(s) were not retried"
         )
     if code == 0:
-        remove_tool_dirs(options.dest, tool_dirs)
-    if code != 0:
-        print(f"extractor exited with code {code}", file=sys.stderr)
+        remove_tool_dirs(dest, tool_dirs)
+    else:
+        LOGGER.error("extractor exited with code %s", code)
+    return code
 
+
+def finish_destination(
+    dest: Path, wine: Path, bar: ProgressBar, *, post_install: bool, verify: bool
+) -> int:
+    """Repair the layout, replay post-install scripts and verify.
+
+    Args:
+        dest: Unpacked folder.
+        wine: Wine binary for post-install helpers.
+        bar: Progress renderer for hashing.
+        post_install: Replay ``build*.bat`` scripts.
+        verify: Check against ``_Redist/fitgirl.md5``.
+
+    Returns:
+        0 when every enabled step succeeded, 1 otherwise.
+    """
     post_code = 0
-    if code == 0 and not options.skip_post_install:
-        repair_layout(options.dest)
-        post_code = run_post_install(options.dest, tools.wine)
-    verify_code = (
-        post_extract_verify(options.dest, bar) if not options.skip_verify else 0
-    )
-    print_install_note()
-    return 0 if code == 0 and post_code == 0 and verify_code == 0 else 1
-
-
-def print_install_note() -> None:
-    """Remind the user what an unpack does not do."""
+    if post_install:
+        repair_layout(dest)
+        post_code = run_post_install(dest, wine)
+    verify_code = post_extract_verify(dest, bar) if verify else 0
     print(
         "note: _Redist installers, registry entries, shortcuts and install-script "
         "renames are not applied - run the redistributables if the game needs them"
     )
-
-
-def run_finish(dest: Path, wine: Path, bar: ProgressBar, *, skip_verify: bool) -> int:
-    """Replay post-install scripts on an already unpacked folder, then verify."""
-    if not dest.is_dir():
-        raise UnfitError(f"not a directory: {dest}")
-    repair_layout(dest)
-    post_code = run_post_install(dest, wine)
-    verify_code = post_extract_verify(dest, bar) if not skip_verify else 0
-    print_install_note()
     return 0 if post_code == 0 and verify_code == 0 else 1
 
 
+def run_extract(
+    pack: PackFiles, tools: Toolchain, options: RunOptions, bar: ProgressBar
+) -> int:
+    """Run the full extract flow: verify bins, check space, unpack, finish.
+
+    Args:
+        pack: The repack.
+        tools: Wine and the extractor.
+        options: Settings for this run.
+        bar: Progress renderer.
+
+    Returns:
+        0 when everything unpacked and verified, 1 otherwise.
+
+    Raises:
+        UnfitError: When the volumes, listing or free space rule out unpacking.
+    """
+    if not options.skip_md5:
+        check_volumes(pack, bar)
+    total = measure_unpacked_size(pack, tools, options.log_path)
+    ensure_free_space(options.dest, total)
+    print(
+        f"unpacking {len(pack.bins)} volume(s), {total / 1024**3:.2f} GiB "
+        f"into {options.dest}"
+    )
+    session = ExtractSession(
+        pack, tools, options, ProgressTarget(bar, options.dest, total)
+    )
+    code = unpack_volumes(session)
+    finish_code = finish_destination(
+        options.dest,
+        tools.wine,
+        bar,
+        post_install=code == 0 and not options.skip_post_install,
+        verify=not options.skip_verify,
+    )
+    return 0 if code == 0 and finish_code == 0 else 1
+
+
+def run_finish(dest: Path, wine: Path, bar: ProgressBar, *, skip_verify: bool) -> int:
+    """Replay post-install scripts on an already unpacked folder, then verify.
+
+    Args:
+        dest: Unpacked folder.
+        wine: Wine binary for post-install helpers.
+        bar: Progress renderer for hashing.
+        skip_verify: Skip the check against ``_Redist/fitgirl.md5``.
+
+    Returns:
+        0 when everything succeeded, 1 otherwise.
+
+    Raises:
+        UnfitError: When ``dest`` is not a folder.
+    """
+    if not dest.is_dir():
+        raise UnfitError(f"not a directory: {dest}")
+    return finish_destination(
+        dest, wine, bar, post_install=True, verify=not skip_verify
+    )
+
+
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    """Parse command-line arguments."""
+    """Parse command-line arguments.
+
+    Args:
+        argv: Arguments without the program name; None reads ``sys.argv``.
+
+    Returns:
+        The parsed arguments.
+    """
     parser = argparse.ArgumentParser(
         prog="unfit",
         description="Verify and unpack FitGirl repacks on Linux (via Wine).",
@@ -1750,15 +2618,23 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def configure_logging() -> None:
     """Send diagnostics to stderr; the run log is written by run_streaming."""
     logging.basicConfig(
-        level=logging.INFO, format="unfit: %(message)s", stream=sys.stderr
+        level=logging.INFO, format="unfit: %(message)s", stream=sys.stderr, force=True
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point; returns a process exit code."""
+    """Entry point.
+
+    Args:
+        argv: Arguments without the program name; None reads ``sys.argv``.
+
+    Returns:
+        Process exit code: 0 success, 1 verification or extraction failure,
+        2 environment or usage error, 130 interrupted.
+    """
     configure_logging()
     args = parse_args(argv)
-    bar = ProgressBar(not args.no_progress and sys.stderr.isatty())
+    bar = ProgressBar(enabled=not args.no_progress and sys.stderr.isatty())
 
     try:
         if args.finish:
@@ -1776,11 +2652,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log_path = log_path_for(pack)
         if args.list:
             return run_list(
-                pack,
-                tools,
-                log_path=log_path,
-                verbose=args.verbose,
-                echo=not args.quiet,
+                pack, tools, log_path, verbose=args.verbose, echo=not args.quiet
             )
 
         dest = (
@@ -1793,12 +2665,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.dry_run:
             command = build_extract_command(
-                tools.wine,
-                tools.extractor,
+                tools,
                 pack.pack_dir,
                 dest,
-                skip_bin_check=True,
-                skip_verify=True,
+                ExtractFlags(skip_bin_check=True, skip_verify=True),
             )
             print(
                 f"would verify {len(pack.bins)} volume(s) against {pack.bins_manifest}"
@@ -1808,7 +2678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("note: destination is not empty, a real run needs --overwrite")
             return 0
 
-        check_destination(pack.pack_dir, dest, args.overwrite)
+        check_destination(pack.pack_dir, dest, overwrite=args.overwrite)
 
         return run_extract(
             pack,
@@ -1825,10 +2695,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             bar,
         )
     except (UnfitError, OSError) as error:
-        print(f"unfit: {error}", file=sys.stderr)
+        LOGGER.error("%s", error)
         return 2
     except KeyboardInterrupt:
-        print("\nunfit: interrupted", file=sys.stderr)
+        LOGGER.error("interrupted")
         return 130
 
 

@@ -138,12 +138,10 @@ def test_apply_moves_creates_parents(tmp_path: Path) -> None:
 
 def test_build_extract_command_extraction() -> None:
     command = unfit.build_extract_command(
-        Path("/wine"),
-        Path("/exe"),
+        unfit.Toolchain(Path("/wine"), Path("/exe")),
         Path("/pack"),
         Path("/dest"),
-        skip_bin_check=True,
-        skip_verify=True,
+        unfit.ExtractFlags(skip_bin_check=True, skip_verify=True),
     )
     assert command == [
         "/wine",
@@ -158,7 +156,10 @@ def test_build_extract_command_extraction() -> None:
 
 def test_build_extract_command_listing_has_no_dest() -> None:
     command = unfit.build_extract_command(
-        Path("/wine"), Path("/exe"), Path("/pack"), Path("/dest"), list_only=True
+        unfit.Toolchain(Path("/wine"), Path("/exe")),
+        Path("/pack"),
+        Path("/dest"),
+        unfit.ExtractFlags(list_only=True),
     )
     assert command == ["/wine", "/exe", "/pack", "--list"]
 

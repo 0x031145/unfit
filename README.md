@@ -40,6 +40,11 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
   Proton Experimental from Steam is enough — no system Wine needed.
 - `fitgirl-extractor.exe` v0.2.1 is downloaded on first use into
   `~/.local/share/unfit/` and checked against a pinned SHA-256.
+- `xdelta3`, only for packs whose post-install scripts apply xdelta patches.
+
+When a required tool is missing, unfit names it and exits (code 2). A
+missing `xdelta3` is noticed after unpacking, when the scripts are read:
+install it, then run `unfit --finish DEST` to replay them.
 
 ## Install
 
@@ -91,7 +96,8 @@ extraction failure, `2` environment or usage error, `130` interrupted.
 5. Retries volumes that failed because they need a tool from another volume
    (below).
 6. Repairs the layout, replays post-install scripts (both below).
-7. Verifies the result against `_Redist/fitgirl.md5`.
+7. Verifies the result against `_Redist/fitgirl.md5`, hashing up to eight
+   files at a time.
 
 ### Layout repair
 
@@ -147,8 +153,7 @@ Without these steps the rebuilt files and the archive fail verification.
 `cmd.exe`. It parses them and accepts only commands it knows:
 
 - `fgpack.exe IN OUT`: run under Wine, from the pack's `work` folder
-- `x.exe -d -s SRC PATCH OUT`: native `xdelta3` when installed, otherwise
-  `x.exe` under Wine
+- `x.exe -d -s SRC PATCH OUT`: run as the native `xdelta3`
 - `raw.exe IN OUT [-ioff=N] [-ilen=N] [-ooff=N]`: done in Python, writes into
   OUT without truncating it
 - `run.exe ... LIST ...`: the list's command chains run in parallel (half the
@@ -185,5 +190,5 @@ whose `setup.exe` ships `unarc.dll` are supported.
 ```sh
 uv run pytest      # unit and end-to-end tests (the latter use a fake wine)
 uv run ruff format . && uv run ruff check .
-uv run mypy --strict unfit.py
+uv run mypy --strict     # unfit.py and tests/
 ```

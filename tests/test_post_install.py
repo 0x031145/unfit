@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -14,9 +16,8 @@ pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="the fake wine binary is a POSIX script"
 )
 
-# Stand-in for wine running FitGirl's helpers. "fgpack" strips a 4-byte
-# header, "x.exe" appends the patch to the source, and x.exe fails on a
-# source named bad.vid_, after the chain already deleted bad.vid.
+# Stand-in for wine running FitGirl's helpers: "fgpack" strips a 4-byte
+# header and winepath maps Linux paths to drive Z:.
 FAKE_WINE = r"""#!/usr/bin/env python3
 import sys
 from pathlib import Path
@@ -29,17 +30,26 @@ if args == ["--version"]:
     print("wine-11.0 (fake)")
     raise SystemExit(0)
 tool = args[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-if tool == "fgpack.exe":
+if tool == "winepath.exe":
+    print("Z:" + args[2].replace("/", "\\"))
+elif tool == "fgpack.exe":
     source, target = unix(args[1]), unix(args[2])
     target.write_bytes(source.read_bytes()[4:])
-elif tool == "x.exe":
-    source, patch, output = (unix(arg) for arg in args[-3:])
-    if source.name == "bad.vid_":
-        print("xdelta3: broken patch")
-        raise SystemExit(3)
-    output.write_bytes(source.read_bytes() + patch.read_bytes())
 else:
     raise SystemExit(f"unexpected tool {tool}")
+"""
+
+# Stand-in for xdelta3: appends the patch to the source, and fails on a
+# source named bad.vid_, after the chain already deleted bad.vid.
+FAKE_XDELTA = r"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+source, patch, output = (Path(arg) for arg in sys.argv[-3:])
+if source.name == "bad.vid_":
+    print("xdelta3: broken patch")
+    raise SystemExit(3)
+output.write_bytes(source.read_bytes() + patch.read_bytes())
 """
 
 CHAIN = (
@@ -121,23 +131,31 @@ def build_unpacked(root: Path, *, extra_build02: str = "") -> Path:
         "if not exist file.done goto start2\n"
         "del file.done placeholder.pak\n",
     )
-    manifest = [f"{md5(expected_file(n))} *..\\Game\\media\\{n}" for n in PACKED]
+    manifest = [
+        f"{md5(expected_file(name))} *..\\Game\\media\\{name}" for name in PACKED
+    ]
     manifest.append(f"{md5(expected_archive())} *..\\Game\\archive.pak")
     write(dest / "_Redist/fitgirl.md5", "\n".join(manifest) + "\n")
     return dest
 
 
 @pytest.fixture
-def fake_wine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A fake wine binary; xdelta3 is hidden so x.exe goes through wine too."""
-    monkeypatch.setattr(unfit, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(unfit, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(unfit, "PREFIX_DIR", tmp_path / "data/wineprefix")
-    monkeypatch.setattr(unfit.shutil, "which", lambda _name: None)
-    wine = tmp_path / "fakewine"
-    wine.write_text(FAKE_WINE)
-    wine.chmod(0o755)
-    return wine
+def fake_xdelta(sandbox: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fake xdelta3 that ``shutil.which`` finds; no other tool is on PATH."""
+    xdelta = sandbox / "bin/xdelta3"
+    xdelta.parent.mkdir(parents=True, exist_ok=True)
+    xdelta.write_text(FAKE_XDELTA)
+    xdelta.chmod(0o755)
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(xdelta) if name == "xdelta3" else None
+    )
+    return xdelta
+
+
+@pytest.fixture
+def fake_wine(make_wine: Callable[[str], Path], fake_xdelta: Path) -> Path:
+    """A fake wine binary, with the fake xdelta3 installed."""
+    return make_wine(FAKE_WINE)
 
 
 def finish(dest: Path, wine: Path) -> int:
@@ -191,6 +209,7 @@ def test_finish_twice_skips_what_already_ran(
         '"fitgirl2-path\\work\\raw.exe" "media\\a.vid" C:\\out.bin\n',
         '"fitgirl2-path\\work\\raw.exe" "media\\a.vid" archive.pak -zero\n',
         "del *.pak\n",
+        "echo [settings] > settings.ini\n",
     ],
 )
 def test_unsupported_commands_leave_the_folder_untouched(
@@ -202,12 +221,32 @@ def test_unsupported_commands_leave_the_folder_untouched(
     dest = build_unpacked(tmp_path, extra_build02=line)
 
     code = finish(dest, fake_wine)
-    output = capsys.readouterr().out
+    errors = capsys.readouterr().err
 
     assert code == 1
-    assert "post-install: not replayed" in output
+    assert "post-install: not replayed" in errors
     assert (dest / "Game/media/a.vid").read_bytes() == b"PKD:clip-a"
     assert (dest / "Game/media/a.vid.x").is_file()
+    assert (dest / "Game/placeholder.pak").is_file()
+
+
+def test_missing_xdelta3_is_reported_before_anything_runs(
+    tmp_path: Path,
+    make_wine: Callable[[str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dest = build_unpacked(tmp_path)
+    wine = make_wine(FAKE_WINE)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    code = finish(dest, wine)
+    errors = capsys.readouterr().err
+
+    assert code == 2
+    assert "xdelta3 is missing" in errors
+    assert f"unfit --finish {dest}" in errors
+    assert (dest / "Game/media/a.vid").read_bytes() == b"PKD:clip-a"
     assert (dest / "Game/placeholder.pak").is_file()
 
 
@@ -222,12 +261,12 @@ def test_a_failing_chain_keeps_the_files_it_deleted(
         handle.write(b"\r\n" + CHAIN.format(n="bad.vid").encode())
 
     code = finish(dest, fake_wine)
-    output = capsys.readouterr().out
+    errors = capsys.readouterr().err
 
     assert code == 1
-    assert "post-install: FAILED" in output
-    assert "x.exe exited with 3: xdelta3: broken patch" in output
-    assert "deleted files kept in" in output
+    assert "post-install: failed at" in errors
+    assert "xdelta3 exited with 3: xdelta3: broken patch" in errors
+    assert "deleted files kept in" in errors
     assert not (dest / "Game/media/bad.vid").exists()
     kept = list((dest / unfit.TRASH_DIR).rglob("*bad.vid"))
     assert [path.read_bytes() for path in kept] == [b"PKD:broken"]
@@ -285,3 +324,11 @@ def test_locate_chain_matches_case_insensitively(tmp_path: Path) -> None:
     )
 
     assert unfit.locate_chain(unfit.FileIndex(tmp_path), chain) == "Game"
+
+
+def test_raw_copy_rejects_a_short_source(tmp_path: Path) -> None:
+    source = write(tmp_path / "in.bin", b"0123")
+    target = write(tmp_path / "out.bin", b"abcdefghij")
+
+    with pytest.raises(unfit.UnfitError, match="shorter than raw.exe expects"):
+        unfit.raw_copy(source, target, {"ioff": 2, "ilen": 5, "ooff": 0})
