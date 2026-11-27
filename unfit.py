@@ -17,17 +17,21 @@ import dataclasses
 import functools
 import hashlib
 import logging
+import lzma
 import os
 import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -69,6 +73,7 @@ class PackFiles:
     """Files that make up one FitGirl repack."""
 
     pack_dir: Path
+    setup: Path
     bins: tuple[Path, ...]
     bins_manifest: Path
 
@@ -264,6 +269,26 @@ def parse_unpacked_bytes(listing: str) -> int:
     )
 
 
+def find_setup(pack_dir: Path) -> Path:
+    """Locate the repack's ``setup.exe``, whatever its case.
+
+    Args:
+        pack_dir: The repack folder.
+
+    Returns:
+        The installer.
+
+    Raises:
+        UnfitError: If the folder is missing or holds no ``setup.exe``.
+    """
+    if not pack_dir.is_dir():
+        raise UnfitError(f"not a directory: {pack_dir}")
+    for entry in sorted(pack_dir.iterdir()):
+        if entry.name.lower() == "setup.exe" and entry.is_file():
+            return entry
+    raise UnfitError(f"no setup.exe in {pack_dir} - is this a FitGirl repack?")
+
+
 def find_pack_files(pack_dir: Path) -> PackFiles:
     """Locate ``setup.exe``, the ``fg-*.bin`` volumes and the MD5 manifest.
 
@@ -276,21 +301,14 @@ def find_pack_files(pack_dir: Path) -> PackFiles:
     Raises:
         UnfitError: If the folder is not a recognisable FitGirl repack.
     """
-    if not pack_dir.is_dir():
-        raise UnfitError(f"not a directory: {pack_dir}")
-
-    setup_candidates = [
-        entry for entry in pack_dir.iterdir() if entry.name.lower() == "setup.exe"
-    ]
-    if not setup_candidates:
-        raise UnfitError(f"no setup.exe in {pack_dir} - is this a FitGirl repack?")
+    setup = find_setup(pack_dir)
     bins = tuple(sorted(path for path in pack_dir.glob("fg-*.bin") if path.is_file()))
     if not bins:
         raise UnfitError(f"no fg-*.bin volumes in {pack_dir}")
     manifests = sorted((pack_dir / "MD5").glob("*.md5"))
     if not manifests:
         raise UnfitError(f"no MD5/*.md5 manifest in {pack_dir}")
-    return PackFiles(pack_dir, bins, manifests[0])
+    return PackFiles(pack_dir, setup, bins, manifests[0])
 
 
 def is_selective(relative_path: str) -> bool:
@@ -976,6 +994,12 @@ def post_extract_verify(dest: Path, bar: ProgressBar) -> int:
 SCRIPT_PLACEHOLDER = re.compile(r"^fitgirl\d*-path\\", re.IGNORECASE)
 SCRIPT_GLOB = re.compile(r"^build\d*\.bat$", re.IGNORECASE)
 POST_INSTALL_TOOLS = frozenset({"fgpack.exe", "x.exe", "raw.exe", "run.exe"})
+INSTALLER_TOOLS = frozenset({"x5.exe", "x2n.exe"})
+TOOL_NOISE = re.compile(
+    r"^(?:[0-9a-f]{4}:(?:fixme|err|warn|trace):|WARNING: radv is not a conformant)",
+    re.IGNORECASE,
+)
+HPATCH_OPTION = re.compile(r"^-(?:m|s(?:-\d+[kmg]?)?)$", re.IGNORECASE)
 SYNC_TOOLS = frozenset({"countdown.exe"})
 WAIT_MARKER = re.compile(r'^if\s+not\s+exist\s+"?([^"\s]+)"?\s+goto\s', re.IGNORECASE)
 ECHO_REDIRECT = re.compile(r'>>?\s*"?([^"\s>]+)"?\s*$')
@@ -1026,6 +1050,7 @@ class PostInstallContext:
     wine: Path
     xdelta: Path
     windows_root: str
+    installer_tools: Path | None = None
 
 
 def split_cmd_words(text: str) -> list[str]:
@@ -1164,6 +1189,30 @@ def xdelta_operands(args: Sequence[str]) -> tuple[str, str, str]:
     return source, positional[0], positional[1]
 
 
+def hpatch_operands(args: Sequence[str]) -> tuple[str, str, str]:
+    """Return ``(old, diff, new)`` for an ``x5.exe`` (HDiffPatch ``hpatchz``) call.
+
+    Args:
+        args: Arguments after ``x5.exe``.
+
+    Returns:
+        The old file, the diff and the file to create.
+
+    Raises:
+        UnfitError: For options other than ``-m``/``-s[-SIZE]`` or a wrong count.
+    """
+    positional: list[str] = []
+    for argument in args:
+        if argument.startswith("-"):
+            if not HPATCH_OPTION.match(argument):
+                raise UnfitError(f"unsupported x5.exe option {argument}")
+        else:
+            positional.append(argument)
+    if len(positional) != 3:
+        raise UnfitError("x5.exe takes exactly 'OLD DIFF NEW' after its options")
+    return positional[0], positional[1], positional[2]
+
+
 def step_files(step: Step) -> StepFiles:
     """Validate a step and report the files it reads and writes.
 
@@ -1190,6 +1239,13 @@ def step_files(step: Step) -> StepFiles:
         if len(positional) != 2:
             raise UnfitError("raw.exe takes exactly 'INPUT OUTPUT [options]'")
         return StepFiles((positional[0],), (positional[1],))
+    if step.tool == "x5.exe":
+        old, diff, new = hpatch_operands(step.args)
+        return StepFiles((old, diff), (new,))
+    if step.tool == "x2n.exe":
+        if len(step.args) != 3 or any(arg.startswith("-") for arg in step.args):
+            raise UnfitError("x2n.exe takes exactly 'TARGET DATA MAP'")
+        return StepFiles(tuple(step.args), (step.args[0],))
     raise UnfitError(f"unsupported post-install tool {step.tool}")
 
 
@@ -1703,7 +1759,12 @@ def run_tool(command: Sequence[str], cwd: Path, *, wine: bool) -> None:
         check=False,
     )
     if result.returncode != 0:
-        output = (result.stdout + result.stderr).strip().splitlines()[-3:]
+        lines = (result.stdout + result.stderr).splitlines()
+        output = [
+            line.strip()
+            for line in lines
+            if line.strip() and not TOOL_NOISE.match(line.strip())
+        ][-3:]
         tool = PureWindowsPath(command[1]).name if wine else Path(command[0]).name
         raise UnfitError(
             f"{tool} exited with {result.returncode}: {' | '.join(output)}"
@@ -1804,8 +1865,42 @@ class ChainRunner:
                 raise UnfitError(f"fgpack.exe did not write {target.name}")
         elif step.tool == "x.exe":
             self.xdelta(step)
+        elif step.tool in INSTALLER_TOOLS:
+            self.installer_tool(step)
         else:
             raise UnfitError(f"unsupported post-install tool {step.tool}")
+
+    def installer_tool(self, step: Step) -> None:
+        """Run a helper unpacked from ``setup.exe`` under Wine.
+
+        ``x5.exe`` (hpatchz) refuses to overwrite its output, so a file left by
+        an interrupted run is moved to the trash first.
+
+        Args:
+            step: An ``x5.exe`` or ``x2n.exe`` step.
+
+        Raises:
+            UnfitError: When the tool is missing, fails or writes nothing.
+        """
+        tools = self._context.installer_tools
+        if tools is None:
+            raise UnfitError(f"{step.tool} was not unpacked from setup.exe")
+        files = step_files(step)
+        if step.tool == "x5.exe":
+            self.delete(files.outputs)
+        options = [arg for arg in step.args if arg.startswith("-")]
+        operands = [
+            self.windows(self.path(arg)) for arg in step.args if not arg.startswith("-")
+        ]
+        program = self.windows(resolve_case_insensitive(tools, step.tool))
+        run_tool(
+            [str(self._context.wine), program, *options, *operands],
+            self._cwd,
+            wine=True,
+        )
+        for output in files.outputs:
+            if not self.path(output).is_file():
+                raise UnfitError(f"{step.tool} did not write {output}")
 
     def xdelta(self, step: Step) -> None:
         """Apply an xdelta3 patch with the native ``xdelta3``.
@@ -1978,7 +2073,43 @@ def run_batch(
     return index
 
 
-def run_post_install(dest: Path, wine: Path, *, workers: int | None = None) -> int:
+def print_tally(tally: PostInstallTally) -> None:
+    """Print how many command chains ran and how many were skipped.
+
+    Args:
+        tally: Counts from one replay.
+    """
+    summary = f"post-install: {tally.ran} command chain(s) ran"
+    if tally.skipped:
+        summary += f", {tally.skipped} skipped (inputs gone, already applied?)"
+    print(summary)
+
+
+def run_post_install(
+    dest: Path, wine: Path, *, setup: Path | None = None, workers: int | None = None
+) -> int:
+    """Replay the pack's ``build*.bat`` scripts, then the commands in ``setup.exe``.
+
+    Args:
+        dest: Unpacked folder.
+        wine: Wine binary for helpers that only exist as Windows programs.
+        setup: The pack's installer; None skips its commands.
+        workers: Parallel chains for run lists; half the CPU threads by default.
+
+    Returns:
+        0 when there was nothing to do or everything ran, 1 on failure.
+
+    Raises:
+        UnfitError: When a tool the replay needs (``xdelta3``, ``innoextract``)
+            is not installed.
+    """
+    code = replay_build_scripts(dest, wine, workers=workers)
+    if code == 0 and setup is not None:
+        code = replay_installer_commands(dest, wine, setup)
+    return code
+
+
+def replay_build_scripts(dest: Path, wine: Path, *, workers: int | None = None) -> int:
     """Replay FitGirl's ``build*.bat`` post-install scripts, if the pack has any.
 
     Every script is parsed before anything runs, so an unsupported command
@@ -2052,10 +2183,442 @@ def run_post_install(dest: Path, wine: Path, *, workers: int | None = None) -> i
     except UnfitError as error:
         LOGGER.error("post-install: failed at %s", error)
         return 1
-    summary = f"post-install: {tally.ran} command chain(s) ran"
-    if tally.skipped:
-        summary += f", {tally.skipped} skipped (inputs gone, already applied?)"
-    print(summary)
+    print_tally(tally)
+    return 0
+
+
+# --- commands in the install script ------------------------------------------
+#
+# Some repacks rebuild files from the install script instead of a build*.bat:
+# after unpacking volumes into FOLDER, its [Code] section runs
+# Exec('{cmd}', '/C "{tmp}\x5.exe" ARGS', '{app}\FOLDER\', ...). The compiled
+# script (PascalScript, "IFPS") sits in the setup header, an LZMA block in
+# setup.exe, and stores string literals inline in program order, so such a
+# command shows up as the literals FOLDER, "/C ", "{tmp}\TOOL", ARGS, "{cmd}".
+# fitgirl-extractor unpacks every volume into the game root, so inputs are
+# taken from FOLDER first and from the root second.
+
+SETUP_LOADER_MAGIC = b"rDlPtS\xcd\xe6\xd7\x7b\x0b\x2a"
+SETUP_LOADER_FIELDS = struct.Struct("<8I")
+SETUP_DATA_MAGIC = b"Inno Setup Setup Data ("
+SETUP_ID_SIZE = 64
+SETUP_BLOCK_HEADER = struct.Struct("<IIB")
+SETUP_CHUNK_SIZE = 4096
+SETUP_CHUNK_CRC = struct.Struct("<I")
+LZMA_PROPS_SIZE = 5
+IFPS_MAGIC = b"IFPS"
+IFPS_CONSTANT = 0x01
+IFPS_TMP_LITERAL = re.compile(rb"\{tmp\}\\", re.IGNORECASE)
+MAX_LITERAL_SIZE = 1 << 16
+CONTROL_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+INSTALLER_EXEC = re.compile(r"^\{tmp\}\\([^\\]+\.exe)$", re.IGNORECASE)
+INSTALLER_WORKDIR = re.compile(r"^\{app\}(?:\\(.*?))?\\?$", re.IGNORECASE)
+
+
+@dataclasses.dataclass(frozen=True)
+class InstallerCommand:
+    """One command the install script runs, with its working folder."""
+
+    origin: str
+    workdir: str
+    chain: Chain
+
+
+def decode_lzma1(payload: bytes) -> bytes:
+    """Decompress Inno Setup's LZMA1 stream: 5 property bytes, then raw data.
+
+    Args:
+        payload: Properties byte, dictionary size and the compressed data.
+
+    Returns:
+        The decompressed bytes.
+
+    Raises:
+        UnfitError: When the properties are invalid or the data is corrupt.
+    """
+    if len(payload) < LZMA_PROPS_SIZE or payload[0] >= 9 * 5 * 5:
+        raise UnfitError("setup header has invalid LZMA properties")
+    props = payload[0]
+    (dict_size,) = struct.unpack_from("<I", payload, 1)
+    lzma_filter = {
+        "id": lzma.FILTER_LZMA1,
+        "lc": props % 9,
+        "lp": props // 9 % 5,
+        "pb": props // 45,
+        "dict_size": dict_size,
+    }
+    decompressor = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[lzma_filter])
+    try:
+        return decompressor.decompress(payload[LZMA_PROPS_SIZE:])
+    except lzma.LZMAError as error:
+        raise UnfitError(f"setup header does not decompress: {error}") from error
+
+
+def read_setup_header(setup: Path) -> bytes:
+    """Read the setup header (settings, entries, compiled script) of ``setup.exe``.
+
+    Args:
+        setup: An Inno Setup 5.1.5+ installer.
+
+    Returns:
+        The decompressed header block.
+
+    Raises:
+        UnfitError: When the file is not such an installer or a checksum fails.
+    """
+    data = setup.read_bytes()
+    table = data.find(SETUP_LOADER_MAGIC)
+    fields_at = table + len(SETUP_LOADER_MAGIC)
+    if table < 0 or len(data) < fields_at + SETUP_LOADER_FIELDS.size:
+        raise UnfitError(f"{setup.name} has no Inno Setup loader table")
+    fields = SETUP_LOADER_FIELDS.unpack_from(data, fields_at)
+    version, offset0, table_crc = fields[0], fields[5], fields[7]
+    if version != 1 or zlib.crc32(data[table : fields_at + 28]) != table_crc:
+        raise UnfitError(f"{setup.name} has an unsupported Inno Setup loader table")
+    if not data.startswith(SETUP_DATA_MAGIC, offset0):
+        raise UnfitError(f"{setup.name} has no setup data where its loader points")
+    position = offset0 + SETUP_ID_SIZE
+    header_crc, stored_size, compressed = SETUP_BLOCK_HEADER.unpack_from(data, position)
+    sizes = data[position + 4 : position + SETUP_BLOCK_HEADER.size]
+    start = position + SETUP_BLOCK_HEADER.size
+    block = data[start : start + stored_size]
+    if zlib.crc32(sizes) != header_crc or len(block) != stored_size:
+        raise UnfitError(f"{setup.name}: setup header is damaged")
+    payload = bytearray()
+    for offset in range(0, stored_size, SETUP_CHUNK_SIZE + SETUP_CHUNK_CRC.size):
+        (chunk_crc,) = SETUP_CHUNK_CRC.unpack_from(block, offset)
+        chunk_start = offset + SETUP_CHUNK_CRC.size
+        chunk = block[chunk_start : chunk_start + SETUP_CHUNK_SIZE]
+        if zlib.crc32(chunk) != chunk_crc:
+            raise UnfitError(f"{setup.name}: setup header chunk fails its checksum")
+        payload += chunk
+    return decode_lzma1(bytes(payload)) if compressed else bytes(payload)
+
+
+def literal_type(code: bytes) -> bytes | None:
+    r"""Find the type id the compiled script uses for string literals.
+
+    Args:
+        code: The compiled script, from its ``IFPS`` magic on.
+
+    Returns:
+        The 4-byte type id of the ``{tmp}\...`` literals, or None when there
+        are none.
+    """
+    types: Counter[bytes] = Counter()
+    for match in IFPS_TMP_LITERAL.finditer(code):
+        start = match.start() - 9
+        if start >= 0 and code[start] == IFPS_CONSTANT:
+            types[code[start + 1 : start + 5]] += 1
+    return types.most_common(1)[0][0] if types else None
+
+
+def installer_literals(header: bytes) -> list[str]:
+    """Return the string literals of the compiled install script, in order.
+
+    Args:
+        header: The setup header from :func:`read_setup_header`.
+
+    Returns:
+        Literals that look like text; empty when the header has no script.
+    """
+    start = header.find(IFPS_MAGIC)
+    if start < 0:
+        return []
+    code = header[start:]
+    string_type = literal_type(code)
+    if string_type is None:
+        return []
+    pattern = re.compile(
+        re.escape(bytes([IFPS_CONSTANT]) + string_type) + rb"(.{4})", re.DOTALL
+    )
+    literals: list[str] = []
+    position = 0
+    while match := pattern.search(code, position):
+        (length,) = struct.unpack("<I", match.group(1))
+        body = code[match.end() : match.end() + length]
+        is_text = len(body) == length and not CONTROL_BYTES.search(body)
+        if 0 < length <= MAX_LITERAL_SIZE and is_text:
+            literals.append(body.decode("cp1252", errors="replace"))
+            position = match.end() + length
+        else:
+            position = match.start() + 1
+    return literals
+
+
+def parse_installer_command(
+    literals: Sequence[str], index: int, origin: str
+) -> InstallerCommand:
+    r"""Turn the literals around ``{tmp}\TOOL`` into a command chain.
+
+    Args:
+        literals: All literals of the script.
+        index: Position of the ``{tmp}\TOOL`` literal.
+        origin: Label for messages.
+
+    Returns:
+        The command with its working folder relative to the game folder.
+
+    Raises:
+        UnfitError: When the literals do not have the expected shape, or the
+            arguments use anything but the tool and ``del``.
+    """
+    tool = PureWindowsPath(literals[index]).name.lower()
+    window = literals[index - 2 : index + 3]
+    if index < 2 or len(window) != 5 or window[4].lower() != "{cmd}":
+        raise UnfitError(f"{origin}: {tool} is not run in the expected way")
+    folder = INSTALLER_WORKDIR.match(window[0])
+    if folder is None:
+        raise UnfitError(f"{origin}: {tool} runs outside the game folder: {window[0]}")
+    workdir = folder.group(1) or ""
+    text = f"{tool} {window[3]}"
+    try:
+        if workdir:
+            check_script_path(workdir)
+        if "{" in window[3]:
+            raise UnfitError("Inno Setup constants in arguments are not supported")
+        parts = split_and_chain(text)
+        step = Step(tool, tuple(split_cmd_words(parts[0])[1:]))
+        files = step_files(step)
+        for operand in (*files.inputs, *files.outputs):
+            check_script_path(operand)
+    except UnfitError as error:
+        raise UnfitError(f"{origin}: {error}: {text}") from error
+    rest = [parse_step(part, origin) for part in parts[1:]]
+    if any(item.tool != "del" for item in rest):
+        raise UnfitError(f"{origin}: only del may follow {tool}: {text}")
+    steps = (step, *(item for item in rest if item.args))
+    return InstallerCommand(origin, workdir, Chain(origin, steps))
+
+
+def parse_installer_commands(
+    literals: Sequence[str],
+) -> tuple[list[InstallerCommand], list[str]]:
+    r"""Find the ``cmd /C "{tmp}\TOOL" ...`` commands of an install script.
+
+    Args:
+        literals: String literals from :func:`installer_literals`.
+
+    Returns:
+        The commands unfit can replay, and the names of other tools the
+        script runs that way in the game folder (tools that only work on the
+        installer's temp files, such as an ``arc.ini`` rewrite, are left out).
+
+    Raises:
+        UnfitError: When a known tool is called in a way unfit cannot replay.
+    """
+    commands: list[InstallerCommand] = []
+    others: list[str] = []
+    for index, literal in enumerate(literals):
+        match = INSTALLER_EXEC.match(literal)
+        if not match or index == 0 or literals[index - 1].strip().lower() != "/c":
+            continue
+        tool = match.group(1).lower()
+        if tool not in INSTALLER_TOOLS:
+            in_game = index >= 2 and INSTALLER_WORKDIR.match(literals[index - 2])
+            if in_game and tool not in others:
+                others.append(tool)
+            continue
+        origin = f"setup.exe command {len(commands) + 1}"
+        commands.append(parse_installer_command(literals, index, origin))
+    return commands, others
+
+
+def place_installer_inputs(root: Path, command: InstallerCommand) -> Path | None:
+    """Gather a command's inputs in its working folder.
+
+    Inputs the extractor left in the game root are moved into the working
+    folder, where the installer would have unpacked them.
+
+    Args:
+        root: Unpacked folder.
+        command: The command to place.
+
+    Returns:
+        The working folder, or None when an input is missing (the command
+        already ran, or its optional volume was not unpacked).
+    """
+    workdir = resolve_case_insensitive(root, command.workdir)
+    moves: list[Move] = []
+    missing: list[str] = []
+    for probe in chain_probes(command.chain):
+        if resolve_case_insensitive(workdir, probe).is_file():
+            continue
+        stray = resolve_case_insensitive(root, probe)
+        if stray.is_file():
+            moves.append(Move(stray, resolve_case_insensitive(workdir, probe)))
+        else:
+            missing.append(probe)
+    if missing:
+        if moves:
+            LOGGER.warning(
+                "%s: skipped, %s missing; left %s in place",
+                command.origin,
+                ", ".join(missing),
+                ", ".join(move.source.name for move in moves),
+            )
+        return None
+    if moves:
+        apply_moves(moves)
+        names = ", ".join(move.source.name for move in moves)
+        print(f"  moved {names} into {command.workdir or '.'}")
+    return workdir
+
+
+def unpack_installer_tools(
+    innoextract: str, setup: Path, staging: Path, names: Sequence[str]
+) -> Path:
+    """Unpack the helper programs the install script runs from ``{tmp}``.
+
+    Args:
+        innoextract: The ``innoextract`` binary.
+        setup: The pack's installer.
+        staging: Empty folder inside the destination to unpack into.
+        names: Program names, e.g. ``x5.exe``.
+
+    Returns:
+        The folder holding the programs.
+
+    Raises:
+        UnfitError: When the staging folder cannot be cleared or a program is
+            not in the installer.
+    """
+    if not remove_tree(staging):
+        raise UnfitError(f"cannot clear {staging}")
+    command = [innoextract, "--extract", "--silent", "--output-dir", str(staging)]
+    for name in names:
+        command += ["--include", f"tmp/{name}"]
+    run_tool([*command, str(setup)], setup.parent, wine=False)
+    folder = staging / "tmp"
+    for name in names:
+        if not resolve_case_insensitive(folder, name).is_file():
+            raise UnfitError(f"innoextract did not unpack {name} from {setup.name}")
+    return folder
+
+
+def has_pending_input(root: Path, commands: Sequence[InstallerCommand]) -> bool:
+    """Return True when an unpacked input still exists, so replay has work to do.
+
+    Inputs that an earlier command creates (e.g. the archive a later command
+    patches in place) do not count: they stay after a finished replay.
+
+    Args:
+        root: Unpacked folder.
+        commands: Commands from the install script.
+
+    Returns:
+        True when such an input is in its working folder or in the root.
+    """
+    produced: set[str] = set()
+    for command in commands:
+        folder = PureWindowsPath(command.workdir)
+        workdir = resolve_case_insensitive(root, command.workdir)
+        for probe in chain_probes(command.chain):
+            if (folder / probe).as_posix().lower() in produced:
+                continue
+            for base in (workdir, root):
+                if resolve_case_insensitive(base, probe).is_file():
+                    return True
+        produced.update(
+            (folder / output).as_posix().lower()
+            for step in command.chain.steps
+            for output in step_files(step).outputs
+        )
+    return False
+
+
+def read_installer_commands(setup: Path) -> list[InstallerCommand] | None:
+    """Read the replayable commands of an install script.
+
+    Args:
+        setup: The pack's installer.
+
+    Returns:
+        The commands, or None when the header cannot be read (logged).
+
+    Raises:
+        UnfitError: When a known tool is called in a way unfit cannot replay.
+    """
+    try:
+        header = read_setup_header(setup)
+    except (UnfitError, OSError) as error:
+        LOGGER.warning("install script commands not checked: %s", error)
+        return None
+    commands, others = parse_installer_commands(installer_literals(header))
+    for tool in others:
+        LOGGER.warning("%s also runs %s, which unfit does not replay", setup.name, tool)
+    return commands
+
+
+def replay_installer_commands(dest: Path, wine: Path, setup: Path) -> int:
+    """Replay the helper commands the install script runs after unpacking.
+
+    Args:
+        dest: Unpacked folder.
+        wine: Wine binary for the helpers.
+        setup: The pack's installer.
+
+    Returns:
+        0 when there was nothing to do or everything ran, 1 on failure.
+
+    Raises:
+        UnfitError: When commands are pending and ``innoextract`` is missing.
+    """
+    try:
+        commands = read_installer_commands(setup)
+    except UnfitError as error:
+        LOGGER.error("post-install: not replayed, %s", error)
+        return 1
+    if not commands:
+        return 0
+    if not has_pending_input(dest, commands):
+        print_tally(PostInstallTally(skipped=len(commands)))
+        return 0
+    innoextract = shutil.which("innoextract")
+    if innoextract is None:
+        rerun = shlex.join(["unfit", "--finish", str(setup.parent), "-d", str(dest)])
+        raise UnfitError(
+            f"innoextract is missing; {setup.name} rebuilds files with helpers it "
+            f"carries. Install innoextract, then run: {rerun}"
+        )
+    print(f"post-install: replaying {len(commands)} command(s) from {setup.name}")
+    names = sorted(
+        {
+            step.tool
+            for command in commands
+            for step in command.chain.steps
+            if step.tool in INSTALLER_TOOLS
+        }
+    )
+    staging = dest / TOOL_STAGING_DIR
+    trash_root = dest / TRASH_DIR
+    tally = PostInstallTally()
+    try:
+        context = PostInstallContext(
+            root=dest,
+            scripts_root=dest,
+            wine=wine,
+            xdelta=Path("xdelta3"),
+            windows_root=windows_path(wine, dest),
+            installer_tools=unpack_installer_tools(innoextract, setup, staging, names),
+        )
+        for command in commands:
+            workdir = place_installer_inputs(dest, command)
+            if workdir is None:
+                tally.skipped += 1
+                continue
+            print(f"  {command.origin}: {command.chain.steps[0].tool}", flush=True)
+            trash = trash_root / command.origin.replace(" ", "-")
+            ChainRunner(context, workdir, trash).run(command.chain)
+            tally.ran += 1
+    except (UnfitError, OSError) as error:
+        LOGGER.error("post-install: failed at %s", error)
+        return 1
+    finally:
+        remove_tree(staging)
+        if trash_root.is_dir() and not any(trash_root.iterdir()):
+            trash_root.rmdir()
+    print_tally(tally)
     return 0
 
 
@@ -2459,26 +3022,36 @@ def unpack_volumes(session: ExtractSession) -> int:
     return code
 
 
+@dataclasses.dataclass(frozen=True)
+class FinishSteps:
+    """Which finishing steps to run on an unpacked folder."""
+
+    setup: Path | None
+    post_install: bool
+    verify: bool
+
+
 def finish_destination(
-    dest: Path, wine: Path, bar: ProgressBar, *, post_install: bool, verify: bool
+    dest: Path, wine: Path, bar: ProgressBar, steps: FinishSteps
 ) -> int:
-    """Repair the layout, replay post-install scripts and verify.
+    """Repair the layout, replay post-install steps and verify.
 
     Args:
         dest: Unpacked folder.
         wine: Wine binary for post-install helpers.
         bar: Progress renderer for hashing.
-        post_install: Replay ``build*.bat`` scripts.
-        verify: Check against ``_Redist/fitgirl.md5``.
+        steps: The installer whose commands to replay (None: only
+            ``build*.bat``), whether to replay at all, and whether to check
+            against ``_Redist/fitgirl.md5``.
 
     Returns:
         0 when every enabled step succeeded, 1 otherwise.
     """
     post_code = 0
-    if post_install:
+    if steps.post_install:
         repair_layout(dest)
-        post_code = run_post_install(dest, wine)
-    verify_code = post_extract_verify(dest, bar) if verify else 0
+        post_code = run_post_install(dest, wine, setup=steps.setup)
+    verify_code = post_extract_verify(dest, bar) if steps.verify else 0
     print(
         "note: _Redist installers, registry entries, shortcuts and install-script "
         "renames are not applied - run the redistributables if the game needs them"
@@ -2519,19 +3092,25 @@ def run_extract(
         options.dest,
         tools.wine,
         bar,
-        post_install=code == 0 and not options.skip_post_install,
-        verify=not options.skip_verify,
+        FinishSteps(
+            setup=pack.setup,
+            post_install=code == 0 and not options.skip_post_install,
+            verify=not options.skip_verify,
+        ),
     )
     return 0 if code == 0 and finish_code == 0 else 1
 
 
-def run_finish(dest: Path, wine: Path, bar: ProgressBar, *, skip_verify: bool) -> int:
-    """Replay post-install scripts on an already unpacked folder, then verify.
+def run_finish(
+    dest: Path, wine: Path, bar: ProgressBar, *, setup: Path | None, skip_verify: bool
+) -> int:
+    """Replay post-install steps on an already unpacked folder, then verify.
 
     Args:
         dest: Unpacked folder.
         wine: Wine binary for post-install helpers.
         bar: Progress renderer for hashing.
+        setup: The pack's installer, to replay its commands; None skips them.
         skip_verify: Skip the check against ``_Redist/fitgirl.md5``.
 
     Returns:
@@ -2542,9 +3121,18 @@ def run_finish(dest: Path, wine: Path, bar: ProgressBar, *, skip_verify: bool) -
     """
     if not dest.is_dir():
         raise UnfitError(f"not a directory: {dest}")
-    return finish_destination(
-        dest, wine, bar, post_install=True, verify=not skip_verify
+    code = finish_destination(
+        dest,
+        wine,
+        bar,
+        FinishSteps(setup=setup, post_install=True, verify=not skip_verify),
     )
+    if code != 0 and setup is None:
+        print(
+            "note: commands in the pack's setup.exe were not checked; to replay "
+            "them too, run: unfit --finish PACK_DIR -d DIR"
+        )
+    return code
 
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -2563,7 +3151,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "pack_dir",
         type=Path,
-        help="folder with setup.exe and fg-*.bin (with --finish: an unpacked folder)",
+        help=(
+            "folder with setup.exe and fg-*.bin "
+            "(with --finish and no -d: the unpacked folder)"
+        ),
     )
     parser.add_argument(
         "-d", "--dest", type=Path, help="where to unpack (default: ~/Games/<name>)"
@@ -2583,12 +3174,18 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--no-post-install",
         action="store_true",
-        help="do not replay the pack's work\\build*.bat post-install scripts",
+        help=(
+            "do not replay the pack's work\\build*.bat scripts or the commands "
+            "in its setup.exe"
+        ),
     )
     parser.add_argument(
         "--finish",
         action="store_true",
-        help="replay post-install scripts on an already unpacked folder, then verify",
+        help=(
+            "replay post-install steps on an already unpacked folder, then verify; "
+            "PACK_DIR -d DIR also replays the commands in setup.exe"
+        ),
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="allow a non-empty destination"
@@ -2638,10 +3235,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.finish:
+            source = args.pack_dir.expanduser().resolve()
+            if args.dest is None:
+                finish_dir, setup = source, None
+            else:
+                finish_dir, setup = args.dest.expanduser().resolve(), find_setup(source)
             return run_finish(
-                args.pack_dir.expanduser().resolve(),
+                finish_dir,
                 detect_wine(args.wine),
                 bar,
+                setup=setup,
                 skip_verify=args.skip_verify,
             )
         pack = find_pack_files(args.pack_dir.expanduser().resolve())

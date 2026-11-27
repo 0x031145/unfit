@@ -11,8 +11,9 @@ incantation.
 > - Only packs whose `setup.exe` is Inno Setup and ships `unarc.dll` (FreeArc)
 >   can be unpacked. Each compression method also needs a 64-bit helper that
 >   works under Wine; methods the tested packs did not use may fail.
-> - Post-install scripts are replayed only when they use the commands listed
->   under [Post-install scripts](#post-install-scripts); anything else is
+> - Post-install steps are replayed only when they use the commands listed
+>   under [Post-install scripts](#post-install-scripts) and
+>   [Install-script commands](#install-script-commands); anything else is
 >   reported and skipped, and the affected files will fail verification.
 > - It is not an installer: redistributables, registry entries and shortcuts
 >   are not applied.
@@ -46,7 +47,8 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
 - keeps a persistent Wine prefix and silences Wine's diagnostics;
 - shows progress from destination growth against the known total;
 - repairs the layout afterwards (see below), replays the pack's post-install
-  scripts, and verifies every file.
+  scripts and the rebuild commands in its install script, and verifies every
+  file.
 
 ## Requirements
 
@@ -57,10 +59,13 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
 - `fitgirl-extractor.exe` v0.2.1 is downloaded on first use into
   `~/.local/share/unfit/` and checked against a pinned SHA-256.
 - `xdelta3`, only for packs whose post-install scripts apply xdelta patches.
+- `innoextract`, only for packs whose install script rebuilds files with
+  helpers it carries (see [Install-script commands](#install-script-commands)).
 
 When a required tool is missing, unfit names it and exits (code 2). A
-missing `xdelta3` is noticed after unpacking, when the scripts are read:
-install it, then run `unfit --finish DEST` to replay them.
+missing `xdelta3` or `innoextract` is noticed after unpacking, when the
+post-install steps are read: install it, then run
+`unfit --finish PACK_DIR -d DEST` to replay them.
 
 ## Install
 
@@ -74,7 +79,8 @@ ln -sf "$PWD/unfit.py" ~/.local/bin/unfit
 unfit PACK_DIR [-d DEST]        verify .bin volumes, then unpack
 unfit --check PACK_DIR          verify .bin volumes only
 unfit --list PACK_DIR           list archive contents
-unfit --finish DIR              replay post-install scripts on an unpacked DIR
+unfit --finish PACK_DIR -d DIR  replay post-install steps on an unpacked DIR
+unfit --finish DIR              same, without the commands in setup.exe
 ```
 
 | Option | Meaning |
@@ -84,8 +90,8 @@ unfit --finish DIR              replay post-install scripts on an unpacked DIR
 | `--list` | ask the extractor for the archive listing |
 | `--skip-md5` | skip volume verification (trusts the files) |
 | `--skip-verify` | skip the post-extraction verification |
-| `--no-post-install` | do not replay `work\build*.bat` (see below) |
-| `--finish` | treat the argument as an already unpacked folder: repair, replay post-install scripts, verify |
+| `--no-post-install` | do not replay `work\build*.bat` or the install-script commands (see below) |
+| `--finish` | work on an already unpacked folder: repair, replay post-install steps, verify. With `-d DIR`, the argument is the pack folder (its `setup.exe` is read for install-script commands) and `DIR` the unpacked folder |
 | `--overwrite` | allow a non-empty destination |
 | `--extractor PATH` | use another `fitgirl-extractor.exe` |
 | `--wine PATH` | use another Wine binary |
@@ -111,7 +117,8 @@ extraction failure, `2` environment or usage error, `130` interrupted.
    extractor output to `~/.local/state/unfit/logs/` (one log per run).
 5. Retries volumes that failed because they need a tool from another volume
    (below).
-6. Repairs the layout, replays post-install scripts (both below).
+6. Repairs the layout, replays post-install scripts and install-script
+   commands (all below).
 7. Verifies the result against `_Redist/fitgirl.md5`, hashing up to eight
    files at a time.
 
@@ -190,13 +197,56 @@ earlier. Chains whose inputs are already gone count as skipped.
 If a chain fails, the run stops. Files that chain had deleted stay in
 `DIR/.unfit-trash/`, and later scripts do not run.
 
+### Install-script commands
+
+Other repacks rebuild files from the install script itself. After unpacking
+some volumes into a game subfolder, its `[Code]` section runs helpers it
+carries in `{tmp}`, for example:
+
+```
+cd {app}\Game\Content\Paks
+{tmp}\x5.exe -s-2g 1.fgpack archive.pak.x5 archive.pak && del 1.fgpack archive.pak.x5
+{tmp}\x5.exe -s-2g 2.fgpack archive.pak.x2d_a.x5 archive.pak.x2d_a && del ...
+{tmp}\x2n.exe archive.pak archive.pak.x2d_a archive.pak.x2m_a && del ...
+```
+
+`x5.exe` is HDiffPatch's `hpatchz` (OLD + DIFF gives NEW); `x2n.exe` patches
+extra data into the archive in place. The extractor puts the inputs in the game
+root and never runs these commands, so the archive is simply missing.
+
+`unfit` reads the compiled script from `setup.exe` without running it: it
+decodes the setup header (LZMA, with Inno Setup's chunk checksums) and walks
+the script's string literals, which are stored in program order. A command is
+the literal sequence `{app}\FOLDER\`, `/C `, `{tmp}\TOOL`, `ARGS`, `{cmd}`.
+Only `x5.exe` (options `-m`, `-s[-SIZE]`) and `x2n.exe` (three files), each
+optionally followed by `del`, are accepted; Inno constants, `..`, absolute
+paths or other programs in `ARGS` stop the replay before anything runs. Tools
+that only work on the installer's temp files (e.g. `fnr.exe` rewriting
+`arc.ini`) are ignored; other tools run in the game folder are reported.
+
+For each command, in order:
+
+1. inputs are looked for in `FOLDER`, then in the root; inputs in the root are
+   moved into `FOLDER`, where the installer would have unpacked them,
+2. if an input is missing (the command already ran, or an optional volume was
+   not unpacked), the command is skipped,
+3. otherwise the helper, unpacked from `setup.exe` with `innoextract` into
+   `DEST/.unfit-tools/`, runs under Wine in `FOLDER`. An output left by an
+   interrupted run is moved aside first, because `hpatchz` refuses to
+   overwrite it, and `del` works as in the scripts above.
+
+`unfit --finish DIR` alone cannot read the installer; use
+`unfit --finish PACK_DIR -d DIR` on a folder unpacked by an older unfit.
+
 ## Limitations
 
 `unfit` does not run FitGirl's other install steps: redistributables in
 `_Redist\` (e.g. `vc_redist.x64.exe`), registry entries, shortcuts, or renames
 the install script performs on other files. Install the redistributables into
-the game's Wine prefix if the launcher needs them. Post-install scripts that
+the game's Wine prefix if the launcher needs them. Post-install steps that
 use commands other than the ones listed above are reported and not replayed.
+Install-script commands are only found in Inno Setup 5.1.5+ installers whose
+loader table and setup header have the layout described above.
 
 Paths must be representable in Windows-1252 (basically ASCII), and only repacks
 whose `setup.exe` ships `unarc.dll` are supported.
