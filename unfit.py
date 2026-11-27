@@ -822,6 +822,10 @@ def wine_environment() -> dict[str, str]:
     environment["WINEDEBUG"] = "-all"
     for name in WINE_HOSTILE_VARIABLES:
         environment.pop(name, None)
+    if sys.platform == "darwin":
+        # MoltenVK otherwise logs its full extension list once per Wine process,
+        # drowning out the extractor's output and the run log.
+        environment["MVK_CONFIG_LOG_LEVEL"] = "0"
     return environment
 
 

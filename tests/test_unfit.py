@@ -359,3 +359,17 @@ def test_detect_wine_uses_macos_candidates_on_darwin(
     monkeypatch.setattr(unfit, "macos_wine_candidates", lambda: [fake_wine])
 
     assert unfit.detect_wine(None) == fake_wine
+
+
+def test_wine_environment_silences_moltenvk_on_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MVK_CONFIG_LOG_LEVEL", raising=False)
+    monkeypatch.setattr(unfit.sys, "platform", "darwin")
+    environment = unfit.wine_environment()
+    assert environment["WINEPREFIX"] == str(unfit.PREFIX_DIR)
+    assert environment["WINEDEBUG"] == "-all"
+    assert environment["MVK_CONFIG_LOG_LEVEL"] == "0"
+
+    monkeypatch.setattr(unfit.sys, "platform", "linux")
+    assert "MVK_CONFIG_LOG_LEVEL" not in unfit.wine_environment()
