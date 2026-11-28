@@ -59,7 +59,9 @@ mismatch, and calls `FreeArcExtract` in a worker process under Wine.
     from Steam is enough — no system Wine needed.
   - **macOS**: Homebrew `wine-stable` or Heroic's `Wine-11.18`
     (`~/Library/Application Support/heroic/tools/wine/...`) is detected
-    automatically. On Apple Silicon, Rosetta 2 is required as well.
+    automatically. On Apple Silicon, Rosetta 2 is required as well. When Heroic
+    has several builds, plain Wine is preferred over `-DXMT` variants (a
+    rendering layer for games); `--wine` overrides the choice.
 - `fitgirl-extractor.exe` v0.2.1 is downloaded on first use into
   `~/.local/share/unfit/` on Linux or
   `~/Library/Application Support/unfit/` on macOS, and checked against a
