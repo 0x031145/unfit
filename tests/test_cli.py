@@ -18,10 +18,14 @@ FAKE_WINE = r'''#!/usr/bin/env python3
 """Stand-in for wine: answers --version, lists, and writes a small payload."""
 
 import hashlib
+import os
 import sys
 from pathlib import Path
 
 args = sys.argv[1:]
+args_file = os.environ.get("UNFIT_TEST_ARGS")
+if args_file:
+    Path(args_file).write_text("\n".join(args))
 if args == ["--version"]:
     print("wine-11.0 (fake)")
     raise SystemExit(0)
@@ -65,6 +69,47 @@ def test_extracts_into_a_destination_that_does_not_exist(
     assert code == 0
     assert (dest / "payload.bin").read_bytes() == b"game data"
     assert list((sandbox / "state/logs").glob("*-Example Game.log"))
+
+
+def test_missing_optional_volume_does_not_block_extraction(
+    sandbox: Path,
+    pack: Path,
+    tool_args: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest = pack / "MD5/fitgirl-bins.md5"
+    manifest.write_text(
+        manifest.read_text() + f"{'0' * 32} *..\\fg-optional-recompile-files.bin\n"
+    )
+    dest = sandbox / "fresh" / "Example Game"
+
+    code = unfit.main([str(pack), "-d", str(dest), *tool_args, "--no-progress"])
+
+    assert code == 0
+    assert (dest / "payload.bin").read_bytes() == b"game data"
+    output = capsys.readouterr().out
+    assert "missing (optional, ignored)" in output
+    assert "skipping 1 unusable volume(s)" in output
+
+
+def test_damaged_volume_is_excluded_from_extractor(
+    sandbox: Path,
+    make_pack: Callable[[str, Sequence[str]], Path],
+    tool_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pack = make_pack(PACK_NAME, ["fg-01.bin", "fg-02.bin"])
+    (pack / "fg-02.bin").write_bytes(b"corrupt")
+    args_file = sandbox / "wine-args.txt"
+    monkeypatch.setenv("UNFIT_TEST_ARGS", str(args_file))
+    dest = sandbox / "fresh" / "Example Game"
+
+    code = unfit.main([str(pack), "-d", str(dest), *tool_args, "--no-progress"])
+
+    assert code == 0
+    passed = args_file.read_text().splitlines()
+    assert "--exclude" in passed
+    assert "fg-02.bin" in passed
 
 
 def test_quiet_hides_extractor_output(

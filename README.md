@@ -17,8 +17,9 @@ Wine incantation.
 >   reported and skipped, and the affected files will fail verification.
 > - It is not an installer: redistributables, registry entries and shortcuts
 >   are not applied.
->
-> Keep the `.bin` files until the final check reports `0 bad, 0 missing`.
+> - Missing or damaged volumes are skipped, not fatal: the rest of the repack is
+>   unpacked and the final check reports which files came from the skipped
+>   volumes. Keep the `.bin` files until that check reports `0 bad, 0 missing`.
 
 ```sh
 unfit /path/to/repack/
@@ -127,13 +128,15 @@ extraction failure, `2` environment or usage error, `130` interrupted.
 ## What it does
 
 1. Finds `setup.exe`, the `fg-*.bin` volumes and `MD5/*.md5`.
-2. Hashes each present volume; missing `fg-selective-*` volumes are ignored
-   (FitGirl treats them as optional), anything else aborts.
+2. Hashes each present volume. Missing `fg-selective-*` and `fg-optional-*`
+   volumes are ignored; any other missing or damaged volume is passed to the
+   extractor as `--exclude` instead of aborting the whole repack.
 3. Runs `fitgirl-extractor --list` to learn the exact unpacked size, creates the
    destination, then checks free space.
 4. Unpacks with `--skip-bin-check --skip-verify`, streaming and logging the
    extractor output to `~/.local/state/unfit/logs/` on Linux or
-   `~/Library/Logs/unfit/logs/` on macOS (one log per run).
+   `~/Library/Logs/unfit/logs/` on macOS (one log per run). Files from skipped
+   volumes show up as missing in the final verification, which exits non-zero.
 5. Retries volumes that failed because they need a tool from another volume
    (below).
 6. Repairs the layout, replays post-install scripts and install-script
