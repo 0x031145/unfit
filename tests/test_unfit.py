@@ -329,21 +329,27 @@ def test_default_dirs_respect_platform_and_env(
     assert unfit.default_state_dir() == tmp_path / "custom-state"
 
 
-def test_macos_wine_candidates_prefers_newest_heroic(
+def test_macos_wine_candidates_prefers_plain_heroic_builds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     heroic_root = tmp_path / "Library/Application Support/heroic/tools/wine"
     older = heroic_root / "Wine-10.0/Contents/Resources/wine/bin/wine"
-    newer = heroic_root / "Wine-11.18/Contents/Resources/wine/bin/wine"
-    make_file(older, b"#")
-    make_file(newer, b"#")
-    os.utime(older.parents[3], (1, 1))
-    os.utime(newer.parents[3], (2, 2))
+    plain = heroic_root / "Wine-11.18/Contents/Resources/wine/bin/wine"
+    dxmt = heroic_root / "Wine-11.18-DXMT/Contents/Resources/wine/bin/wine"
+    for path, runtime, stamp in (
+        (older, heroic_root / "Wine-10.0", 1),
+        (plain, heroic_root / "Wine-11.18", 2),
+        (dxmt, heroic_root / "Wine-11.18-DXMT", 3),
+    ):
+        make_file(path, b"#")
+        os.utime(runtime, (stamp, stamp))
 
     candidates = unfit.macos_wine_candidates()
     assert Path("/opt/homebrew/bin/wine") in candidates
-    assert candidates.index(newer) < candidates.index(older)
+    assert candidates.index(plain) < candidates.index(older)
+    assert candidates.index(plain) < candidates.index(dxmt)
+    assert candidates.index(older) < candidates.index(dxmt)
     assert (
         tmp_path / "Applications/Wine Stable.app/Contents/Resources/wine/bin/wine"
         in candidates

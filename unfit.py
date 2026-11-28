@@ -621,8 +621,10 @@ def proton_candidates() -> list[Path]:
 def macos_wine_candidates() -> list[Path]:
     """List common ``wine`` binary locations on macOS.
 
-    Heroic's builds come most recently installed first: its list mixes Wine
-    and CrossOver builds, whose version numbers do not compare.
+    Heroic's plain builds come before rendering-layer variants (``*-DXMT``):
+    DXMT is a DirectX-to-Metal layer for games, while unfit only runs a console
+    extractor, whose FreeArc decompression has been seen to fail under it.
+    Within each group the most recently installed build comes first.
 
     Returns:
         Homebrew, Heroic and ``Wine *.app`` paths, which may not exist.
@@ -633,13 +635,15 @@ def macos_wine_candidates() -> list[Path]:
     ]
     heroic_root = Path.home() / "Library/Application Support/heroic/tools/wine"
     if heroic_root.is_dir():
-        heroic_bins: list[tuple[float, Path]] = []
+        heroic_bins: list[tuple[bool, float, Path]] = []
         for runtime in heroic_root.iterdir():
             wine = runtime / "Contents/Resources/wine/bin/wine"
             if wine.is_file():
-                heroic_bins.append((runtime.stat().st_mtime, wine))
-        heroic_bins.sort(key=lambda item: item[0], reverse=True)
-        candidates.extend(wine for _, wine in heroic_bins)
+                heroic_bins.append(
+                    ("dxmt" in runtime.name.lower(), runtime.stat().st_mtime, wine)
+                )
+        heroic_bins.sort(key=lambda item: (item[0], -item[1]))
+        candidates.extend(wine for _, _, wine in heroic_bins)
     for app_dir in (Path("/Applications"), Path.home() / "Applications"):
         for name in ("Wine Stable.app", "Wine Staging.app", "Wine Devel.app"):
             candidates.append(app_dir / name / "Contents/Resources/wine/bin/wine")
