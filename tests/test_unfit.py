@@ -85,9 +85,10 @@ def test_parse_unpacked_bytes(listing: str, expected: int) -> None:
     assert unfit.parse_unpacked_bytes(listing) == expected
 
 
-def test_is_selective() -> None:
-    assert unfit.is_selective("fg-selective-music.bin")
-    assert not unfit.is_selective("fg-01.bin")
+def test_is_optional_volume() -> None:
+    assert unfit.is_optional_volume("fg-selective-music.bin")
+    assert unfit.is_optional_volume("fg-optional-recompile-files.bin")
+    assert not unfit.is_optional_volume("fg-01.bin")
 
 
 def test_hash_file_matches_hashlib(tmp_path: Path) -> None:
@@ -224,11 +225,53 @@ def test_find_pack_files_requires_setup_and_bins(tmp_path: Path) -> None:
     assert pack.bins == (tmp_path / "fg-01.bin",)
 
 
-def test_required_missing_ignores_selective() -> None:
+def test_required_missing_ignores_optional_volumes() -> None:
     report = unfit.VerifyReport(
-        total=3, ok=[], bad=[], missing=["fg-selective-4k.bin", "fg-03.bin"]
+        total=4,
+        ok=[],
+        bad=[],
+        missing=[
+            "fg-selective-4k.bin",
+            "fg-optional-recompile-files.bin",
+            "fg-03.bin",
+        ],
     )
     assert unfit.required_missing(report) == ["fg-03.bin"]
+
+
+def test_check_volumes_excludes_missing_and_damaged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pack_dir = tmp_path / "Game"
+    (pack_dir / "MD5").mkdir(parents=True)
+    (pack_dir / "setup.exe").write_bytes(b"stub")
+    make_file(pack_dir / "fg-01.bin", b"good")
+    make_file(pack_dir / "fg-03.bin", b"corrupt")
+    (pack_dir / "MD5/fitgirl-bins.md5").write_text(
+        f"{hashlib.md5(b'good').hexdigest()} *..\\fg-01.bin\n"
+        f"{'0' * 32} *..\\fg-optional-recompile-files.bin\n"
+        f"{'1' * 32} *..\\fg-03.bin\n"
+    )
+    pack = unfit.find_pack_files(pack_dir)
+    bar = unfit.ProgressBar(enabled=False)
+
+    assert unfit.check_volumes(pack, bar) == (
+        "fg-03.bin",
+        "fg-optional-recompile-files.bin",
+    )
+    assert "skipping 2 unusable volume(s)" in capsys.readouterr().out
+
+
+def test_check_volumes_requires_one_usable_volume(tmp_path: Path) -> None:
+    pack_dir = tmp_path / "Game"
+    (pack_dir / "MD5").mkdir(parents=True)
+    (pack_dir / "setup.exe").write_bytes(b"stub")
+    make_file(pack_dir / "fg-01.bin", b"corrupt")
+    (pack_dir / "MD5/fitgirl-bins.md5").write_text(f"{'0' * 32} *..\\fg-01.bin\n")
+    pack = unfit.find_pack_files(pack_dir)
+
+    with pytest.raises(unfit.UnfitError, match="no usable volumes"):
+        unfit.check_volumes(pack, unfit.ProgressBar(enabled=False))
 
 
 def test_main_rejects_missing_pack(
@@ -254,15 +297,14 @@ def test_sha256_file(tmp_path: Path) -> None:
 def test_describe_report_mentions_optional_volumes_only_when_absent() -> None:
     report = unfit.VerifyReport(total=2, ok=["fg-01.bin", "fg-02.bin"])
     assert (
-        unfit.describe_report(report, selective_missing=True)
-        == "2 ok, 0 bad, 0 missing"
+        unfit.describe_report(report, optional_missing=True) == "2 ok, 0 bad, 0 missing"
     )
-    report.missing = ["fg-selective-4k.bin"]
-    assert "1 optional selective volume(s) ignored" in unfit.describe_report(
-        report, selective_missing=True
+    report.missing = ["fg-optional-recompile-files.bin"]
+    assert "1 optional volume(s) ignored" in unfit.describe_report(
+        report, optional_missing=True
     )
     report.missing = ["fg-03.bin"]
-    assert "optional" not in unfit.describe_report(report, selective_missing=True)
+    assert "optional" not in unfit.describe_report(report, optional_missing=True)
 
 
 def test_proton_candidates_prefers_experimental(

@@ -99,7 +99,7 @@ PROGRESS_INTERVAL = 1.5
 REDRAW_INTERVAL = 0.2
 HASH_WORKERS = min(8, os.cpu_count() or 1)
 
-SELECTIVE_PREFIX = "fg-selective"
+OPTIONAL_PREFIXES = ("fg-selective-", "fg-optional-")
 MANIFEST_TAG = re.compile(r"\s*\[[^\]]*\]\s*$")
 LIST_TOTAL = re.compile(r"(\d+) files?, (\d+) MB unpacked", re.IGNORECASE)
 MANIFEST_DIGEST = re.compile(r"[0-9a-fA-F]{32}")
@@ -357,16 +357,21 @@ def find_pack_files(pack_dir: Path) -> PackFiles:
     return PackFiles(pack_dir, setup, bins, manifests[0])
 
 
-def is_selective(relative_path: str) -> bool:
-    """Return True for optional selective-download volumes.
+def is_optional_volume(relative_path: str) -> bool:
+    """Return True for volumes FitGirl ships as optional downloads.
+
+    Both selective-download (``fg-selective-*``) and optional
+    (``fg-optional-*``) volumes can be missing: the installer works without
+    them, even though ``fitgirl-bins.md5`` lists every volume.
 
     Args:
         relative_path: Volume path from the bins manifest.
 
     Returns:
-        True for ``fg-selective-*`` volumes.
+        True for optional volumes.
     """
-    return PurePosixPath(relative_path).name.lower().startswith(SELECTIVE_PREFIX)
+    name = PurePosixPath(relative_path).name.lower()
+    return any(name.startswith(prefix) for prefix in OPTIONAL_PREFIXES)
 
 
 def hash_file(path: Path, on_chunk: Callable[[int], None] | None = None) -> str:
@@ -477,12 +482,12 @@ def verify_against_manifest(
     return report
 
 
-def describe_report(report: VerifyReport, *, selective_missing: bool = False) -> str:
+def describe_report(report: VerifyReport, *, optional_missing: bool = False) -> str:
     """Render a one-line verification summary.
 
     Args:
         report: Verification outcome.
-        selective_missing: Mention missing selective volumes as ignored.
+        optional_missing: Mention missing optional volumes as ignored.
 
     Returns:
         A summary such as ``3 ok, 0 bad, 1 missing``.
@@ -490,9 +495,9 @@ def describe_report(report: VerifyReport, *, selective_missing: bool = False) ->
     summary = (
         f"{len(report.ok)} ok, {len(report.bad)} bad, {len(report.missing)} missing"
     )
-    optional = sum(1 for relative in report.missing if is_selective(relative))
-    if selective_missing and optional:
-        summary += f" ({optional} optional selective volume(s) ignored)"
+    optional = sum(1 for relative in report.missing if is_optional_volume(relative))
+    if optional_missing and optional:
+        summary += f" ({optional} optional volume(s) ignored)"
     return summary
 
 
@@ -801,6 +806,7 @@ class ExtractFlags:
     skip_verify: bool = False
     verbose: bool = False
     only: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
 
 
 def build_extract_command(
@@ -824,6 +830,8 @@ def build_extract_command(
         command.append("--list")
     for volume in flags.only:
         command.extend(["--only", volume])
+    for volume in flags.exclude:
+        command.extend(["--exclude", volume])
     if flags.skip_bin_check:
         command.append("--skip-bin-check")
     if flags.skip_verify:
@@ -1008,21 +1016,23 @@ def verify_bins(pack: PackFiles, bar: ProgressBar) -> VerifyReport:
             f"  {entry.path}: MISMATCH (expected {entry.expected}, got {entry.actual})"
         )
     for relative in report.missing:
-        label = "missing (selective, ignored)" if is_selective(relative) else "MISSING"
+        label = (
+            "missing (optional, ignored)" if is_optional_volume(relative) else "MISSING"
+        )
         print(f"  {relative}: {label}")
     return report
 
 
 def required_missing(report: VerifyReport) -> list[str]:
-    """Missing volumes that are not optional selective downloads.
+    """Missing volumes that are not optional downloads.
 
     Args:
         report: Volume verification outcome.
 
     Returns:
-        Missing volumes that block unpacking.
+        Missing volumes that are not optional.
     """
-    return [relative for relative in report.missing if not is_selective(relative)]
+    return [relative for relative in report.missing if not is_optional_volume(relative)]
 
 
 def destination_manifest(dest: Path) -> dict[str, str] | None:
@@ -2780,7 +2790,7 @@ def run_check(pack: PackFiles, bar: ProgressBar) -> int:
         0 when every required volume matched, 1 otherwise.
     """
     report = verify_bins(pack, bar)
-    print(f"bins: {describe_report(report, selective_missing=True)}")
+    print(f"bins: {describe_report(report, optional_missing=True)}")
     return 1 if report.bad or required_missing(report) else 0
 
 
@@ -2952,6 +2962,7 @@ class ExtractSession:
     tools: Toolchain
     options: RunOptions
     progress: ProgressTarget
+    exclude: tuple[str, ...] = ()
 
     def unpack(self, extractor: Path, only: tuple[str, ...], failed: list[str]) -> int:
         """Run the extractor on the selected volumes (all when ``only`` is empty).
@@ -2969,6 +2980,7 @@ class ExtractSession:
             skip_verify=True,
             verbose=self.options.verbose,
             only=only,
+            exclude=self.exclude,
         )
         tools = dataclasses.replace(self.tools, extractor=extractor)
         command = build_extract_command(
@@ -3026,25 +3038,37 @@ def retry_with_tools(
     return 0
 
 
-def check_volumes(pack: PackFiles, bar: ProgressBar) -> None:
-    """Verify the ``.bin`` volumes before unpacking.
+def check_volumes(pack: PackFiles, bar: ProgressBar) -> tuple[str, ...]:
+    """Verify the ``.bin`` volumes and select those safe to unpack.
+
+    Missing or damaged volumes are skipped instead of blocking the whole
+    repack. The final check against ``_Redist/fitgirl.md5`` reports the files
+    that came from them, so a partial unpack is never presented as complete.
 
     Args:
         pack: The repack.
         bar: Progress renderer for hashing.
 
+    Returns:
+        Volume names for the extractor's ``--exclude`` switch.
+
     Raises:
-        UnfitError: When a volume is damaged or a required one is missing.
+        UnfitError: When no volume is usable.
     """
     report = verify_bins(pack, bar)
-    print(f"bins: {describe_report(report, selective_missing=True)}")
-    if report.bad:
-        raise UnfitError(
-            "volume checksum mismatch - delete and re-download those files"
+    print(f"bins: {describe_report(report, optional_missing=True)}")
+    if not report.ok:
+        raise UnfitError("no usable volumes: all volumes are missing or damaged")
+    exclude = tuple(
+        sorted(
+            [entry.path for entry in report.bad]
+            + [relative for relative in report.missing]
         )
-    missing = required_missing(report)
-    if missing:
-        raise UnfitError(f"missing volumes: {', '.join(missing)}")
+    )
+    if exclude:
+        print(f"skipping {len(exclude)} unusable volume(s): {', '.join(exclude)}")
+        print("files from skipped volumes will be reported by final verification")
+    return exclude
 
 
 def measure_unpacked_size(pack: PackFiles, tools: Toolchain, log_path: Path) -> int:
@@ -3178,16 +3202,16 @@ def run_extract(
     Raises:
         UnfitError: When the volumes, listing or free space rule out unpacking.
     """
-    if not options.skip_md5:
-        check_volumes(pack, bar)
+    exclude = check_volumes(pack, bar) if not options.skip_md5 else ()
     total = measure_unpacked_size(pack, tools, options.log_path)
     ensure_free_space(options.dest, total)
+    usable = [volume for volume in pack.bins if volume.name not in exclude]
     print(
-        f"unpacking {len(pack.bins)} volume(s), {total / 1024**3:.2f} GiB "
+        f"unpacking {len(usable)} volume(s), {total / 1024**3:.2f} GiB "
         f"into {options.dest}"
     )
     session = ExtractSession(
-        pack, tools, options, ProgressTarget(bar, options.dest, total)
+        pack, tools, options, ProgressTarget(bar, options.dest, total), exclude
     )
     code = unpack_volumes(session)
     finish_code = finish_destination(
